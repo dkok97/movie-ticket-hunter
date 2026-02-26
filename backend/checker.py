@@ -175,30 +175,42 @@ def _parse_amc_movie_page(
             except (json.JSONDecodeError, TypeError):
                 pass
 
-    # --- Strategy B: Look for theatre name + showtime buttons in HTML ---
+    # --- Strategy B: Look for showtime links with href="/showtimes/{id}" ---
+    # AMC showtime links look like:
+    #   <a ... href="/showtimes/140692343" aria-describedby="...amc-empire-25...">8:00pm</a>
+    # The direct seat-selection URL is: /showtimes/{id}/seats
     theatre_lower = theatre_name.lower()
-    theatre_words = set(theatre_slug.replace("-", " ").split()) if theatre_slug else set()
+    theatre_slug_normalised = theatre_slug.replace("-", " ") if theatre_slug else ""
 
-    # Find all elements that could be showtime buttons/links
-    showtime_links = soup.find_all("a", href=re.compile(r"(order|ticket|checkout|showtime)", re.IGNORECASE))
+    showtime_links = soup.find_all("a", href=re.compile(r"^/showtimes/\d+$"))
     for link in showtime_links:
-        # Check if this showtime is associated with our theatre
-        parent_text = ""
+        # Check if this showtime belongs to our theatre using aria-describedby
+        aria = link.get("aria-describedby", "")
+        aria_lower = aria.lower().replace("-", " ")
+
+        # Also check parent section text for theatre name
+        parent_has_theatre = False
         for parent in link.parents:
             parent_text = parent.get_text(" ", strip=True).lower()
-            if theatre_lower in parent_text or (theatre_words and theatre_words.issubset(parent_text.split())):
+            if theatre_lower in parent_text:
+                parent_has_theatre = True
                 break
-            # Don't go too far up
-            if parent.name in ("body", "html"):
-                parent_text = ""
+            if parent.name in ("body", "html", "main"):
                 break
 
-        if not parent_text:
+        theatre_in_aria = (
+            (theatre_slug_normalised and theatre_slug_normalised in aria_lower) or
+            (theatre_lower.replace("amc ", "") in aria_lower)
+        )
+
+        if not theatre_in_aria and not parent_has_theatre:
             continue
 
-        href = link.get("href", "")
-        link_text = link.get_text(strip=True)
-        ticket_url = f"https://www.amctheatres.com{href}" if href.startswith("/") else href
+        href = link.get("href", "")  # e.g. "/showtimes/140692343"
+        link_text = link.get_text(strip=True)  # e.g. "8:00pm"
+
+        # Build the direct seat-selection URL
+        seat_url = f"https://www.amctheatres.com{href}/seats"
 
         if _is_evening_time(link_text, evening_hour):
             findings.append({
@@ -207,7 +219,7 @@ def _parse_amc_movie_page(
                 "movie_name": movie_name,
                 "showtime": link_text,
                 "show_date": target_date,
-                "ticket_url": ticket_url or movie_url,
+                "ticket_url": seat_url,
             })
 
     # --- Strategy C: Check if the page mentions the theatre at all ---
@@ -376,25 +388,43 @@ def _parse_amc_api_response(
 
 
 async def _amc_showtime_page(theatre: dict, movie_name: str, target_date: str) -> list[dict]:
-    """Scrape the AMC website showtime page for a specific theatre and date."""
+    """Scrape the AMC website showtime page for a specific theatre and date.
+
+    Tries two URL patterns:
+      1. /movie-theatres/{region}/{slug}/showtimes?date={date}  (the main page users see)
+      2. /showtimes/all/{date}/{slug}/all  (legacy/API-style URL)
+    """
     slug = theatre.get("slug", "")
     if not slug:
         return []
 
-    url = f"https://www.amctheatres.com/showtimes/all/{target_date}/{slug}/all"
-    log.info("Checking AMC web: %s", url)
+    region = theatre.get("region", "")
 
-    try:
-        async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True) as client:
-            resp = await client.get(url, headers=BROWSER_HEADERS)
-            if resp.status_code != 200:
-                log.warning("AMC web returned %s for %s", resp.status_code, slug)
-                return []
+    urls_to_try = []
+    if region:
+        # Primary: the theatre-specific page (same format as the screenshot)
+        urls_to_try.append(
+            f"https://www.amctheatres.com/movie-theatres/{region}/{slug}/showtimes?date={target_date}"
+        )
+    # Fallback: legacy showtime URL
+    urls_to_try.append(f"https://www.amctheatres.com/showtimes/all/{target_date}/{slug}/all")
 
-            return _parse_amc_html(resp.text, movie_name, theatre, target_date, url)
-    except Exception as exc:
-        log.error("AMC web scraping error for %s: %s", slug, exc)
-        return []
+    for url in urls_to_try:
+        log.info("Checking AMC theatre page: %s", url)
+        try:
+            async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True) as client:
+                resp = await client.get(url, headers=BROWSER_HEADERS)
+                if resp.status_code != 200:
+                    log.warning("AMC theatre page returned %s for %s", resp.status_code, url)
+                    continue
+
+                findings = _parse_amc_html(resp.text, movie_name, theatre, target_date, url)
+                if findings:
+                    return findings
+        except Exception as exc:
+            log.error("AMC web scraping error for %s: %s", url, exc)
+
+    return []
 
 
 def _find_amc_movie_url(soup: BeautifulSoup, html: str, movie_lower: str, target_date: str) -> str:
@@ -447,8 +477,50 @@ def _parse_amc_html(
     # Try to find the proper movie-specific URL first
     movie_url = _find_amc_movie_url(soup, html, movie_lower, target_date) or page_url
 
-    # Look for movie titles and showtimes in the page
-    # AMC uses various class patterns — try multiple selectors
+    # Strategy B1: Look for showtime links with href="/showtimes/{id}" near our movie
+    # These are the actual clickable showtime buttons on AMC pages.
+    # The link text is the time (e.g. "8:00pm"), and the aria-describedby
+    # contains movie/theatre slugs for context.
+    showtime_links = soup.find_all("a", href=re.compile(r"^/showtimes/\d+$"))
+    for link in showtime_links:
+        link_text = link.get_text(strip=True)  # e.g. "8:00pm"
+        aria = (link.get("aria-describedby", "") or "").lower()
+
+        # Check if this showtime belongs to our movie
+        movie_words = movie_lower.replace(":", "").split()
+        movie_in_aria = all(w in aria.replace("-", " ") for w in movie_words if len(w) > 2)
+
+        # Also check parent section text
+        movie_in_parent = False
+        if not movie_in_aria:
+            for parent in link.parents:
+                pt = parent.get_text(" ", strip=True).lower()
+                if movie_lower in pt:
+                    movie_in_parent = True
+                    break
+                if parent.name in ("body", "html", "main"):
+                    break
+
+        if not movie_in_aria and not movie_in_parent:
+            continue
+
+        href = link.get("href", "")
+        seat_url = f"https://www.amctheatres.com{href}/seats"
+
+        if _is_evening_time(link_text, evening_hour):
+            findings.append({
+                "source": "amc_web",
+                "theatre_name": theatre.get("name", "AMC Theatre"),
+                "movie_name": movie_name,
+                "showtime": link_text,
+                "show_date": target_date,
+                "ticket_url": seat_url,
+            })
+
+    if findings:
+        return findings
+
+    # Strategy B2: Fallback — look for movie sections with showtime elements
     movie_sections = soup.find_all(
         ["div", "section", "article"],
         class_=re.compile(r"(showtime|movie|film)", re.IGNORECASE),
@@ -459,7 +531,7 @@ def _parse_amc_html(
         if movie_lower not in section_text:
             continue
 
-        # Found the movie — look for showtime links/buttons
+        # Found the movie — look for any showtime links inside
         time_elements = section.find_all(
             ["a", "button", "span", "time"],
             class_=re.compile(r"(showtime|time|btn)", re.IGNORECASE),
@@ -468,9 +540,14 @@ def _parse_amc_html(
         for elem in time_elements:
             time_text = elem.get_text(strip=True)
             href = elem.get("href", "")
-            ticket_url = f"https://www.amctheatres.com{href}" if href and href.startswith("/") else href
+            # If it's a /showtimes/{id} link, build seat URL
+            if href and re.match(r"^/showtimes/\d+$", href):
+                ticket_url = f"https://www.amctheatres.com{href}/seats"
+            elif href and href.startswith("/"):
+                ticket_url = f"https://www.amctheatres.com{href}"
+            else:
+                ticket_url = href
 
-            # Try to parse the time
             if _is_evening_time(time_text, evening_hour):
                 findings.append({
                     "source": "amc_web",
@@ -481,7 +558,6 @@ def _parse_amc_html(
                     "ticket_url": ticket_url or movie_url,
                 })
 
-        # If we found the movie section but no specific times, still report it
         if not time_elements:
             findings.append({
                 "source": "amc_web",

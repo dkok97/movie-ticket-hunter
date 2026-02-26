@@ -32,8 +32,8 @@ def _build_amc_purchase_url(finding: dict) -> str:
     target_date = conf.get("target_date", "")
     ticket_url = finding.get("ticket_url", "")
 
-    # If we already have a direct order/checkout link, use it
-    if ticket_url and any(kw in ticket_url.lower() for kw in ("/order", "/checkout", "ticketing")):
+    # If we already have a direct purchase/seat-selection link, use it
+    if ticket_url and any(kw in ticket_url.lower() for kw in ("/seats", "/order", "/checkout", "ticketing")):
         return ticket_url
 
     # Build theatre-specific movie page URL
