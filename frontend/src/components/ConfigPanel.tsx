@@ -103,8 +103,11 @@ export default function ConfigPanel({ config, onSave, onRefresh }: Props) {
               type="number"
               min={0}
               max={23}
-              value={form.evening_start_hour ?? 16}
-              onChange={(e) => handleChange("evening_start_hour", parseInt(e.target.value) || 16)}
+              value={form.evening_start_hour ?? ""}
+              onChange={(e) => {
+                const v = e.target.value;
+                handleChange("evening_start_hour", v === "" ? ("" as any) : parseInt(v));
+              }}
             />
           </Field>
         </div>
@@ -145,8 +148,11 @@ export default function ConfigPanel({ config, onSave, onRefresh }: Props) {
               type="number"
               min={1}
               max={20}
-              value={form.num_tickets ?? 2}
-              onChange={(e) => handleChange("num_tickets", parseInt(e.target.value) || 2)}
+              value={form.num_tickets ?? ""}
+              onChange={(e) => {
+                const v = e.target.value;
+                handleChange("num_tickets", v === "" ? ("" as any) : parseInt(v));
+              }}
             />
           </Field>
         </div>
@@ -166,10 +172,11 @@ export default function ConfigPanel({ config, onSave, onRefresh }: Props) {
               type="number"
               min={1}
               max={1440}
-              value={form.poll_interval_minutes ?? 1}
-              onChange={(e) =>
-                handleChange("poll_interval_minutes", parseInt(e.target.value) || 5)
-              }
+              value={form.poll_interval_minutes ?? ""}
+              onChange={(e) => {
+                const v = e.target.value;
+                handleChange("poll_interval_minutes", v === "" ? ("" as any) : parseInt(v));
+              }}
             />
           </Field>
           <Field label="AMC API Key (optional)">
