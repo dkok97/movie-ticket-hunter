@@ -66,6 +66,7 @@ async def scheduled_check():
         log.exception("Check failed: %s", exc)
         db.fail_run(run_id, str(exc))
     finally:
+        db.gc_runs(keep=100)
         _is_running = False
 
 

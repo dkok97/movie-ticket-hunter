@@ -166,6 +166,23 @@ def clear_history():
     conn.close()
 
 
+def gc_runs(keep: int = 100):
+    """Keep only the latest `keep` runs; delete older runs and their findings."""
+    conn = _conn()
+    conn.execute(
+        """DELETE FROM ticket_findings WHERE run_id IN (
+               SELECT id FROM bot_runs ORDER BY id DESC LIMIT -1 OFFSET ?
+           )""",
+        (keep,),
+    )
+    conn.execute(
+        "DELETE FROM bot_runs WHERE id NOT IN (SELECT id FROM bot_runs ORDER BY id DESC LIMIT ?)",
+        (keep,),
+    )
+    conn.commit()
+    conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
