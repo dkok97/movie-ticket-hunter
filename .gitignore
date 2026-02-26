@@ -31,3 +31,4 @@ Thumbs.db
 # pyenv
 .python-version
 .vercel
+.env.vercel
