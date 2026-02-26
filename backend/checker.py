@@ -1,0 +1,943 @@
+"""Ticket availability checkers for AMC and Fandango.
+
+Each checker tries multiple strategies (API → embedded JSON → HTML scraping)
+and returns a list of finding dicts.
+"""
+
+import httpx
+import json
+import re
+import logging
+from datetime import datetime
+from bs4 import BeautifulSoup
+from urllib.parse import quote_plus
+
+import config as cfg
+
+log = logging.getLogger("dhurandhar.checker")
+
+# Common browser-like headers to avoid being blocked
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+}
+
+TIMEOUT = httpx.Timeout(20.0, connect=10.0)
+
+
+# ===========================================================================
+# AMC Checker
+# ===========================================================================
+
+async def check_amc(theatre: dict, movie_name: str, target_date: str) -> list[dict]:
+    """Check AMC for ticket availability. Tries direct movie page first, then other strategies."""
+    conf = cfg.get_config()
+    api_key = conf.get("amc_api_key", "")
+    vendor_id = conf.get("amc_vendor_id", "")
+    movie_slug = conf.get("amc_movie_slug", "")
+
+    findings: list[dict] = []
+
+    # Strategy 0 (priority): Direct AMC movie page (if slug is configured)
+    if movie_slug:
+        findings = await _amc_direct_movie_page(movie_slug, theatre, movie_name, target_date)
+        if findings:
+            return findings
+
+    # Strategy 1: AMC Developer API (if credentials provided)
+    if api_key and vendor_id:
+        findings = await _amc_developer_api(theatre, movie_name, target_date, api_key, vendor_id)
+        if findings:
+            return findings
+
+    # Strategy 2: AMC web — showtime page
+    findings = await _amc_showtime_page(theatre, movie_name, target_date)
+    if findings:
+        return findings
+
+    # Strategy 3: AMC web — movie search
+    findings = await _amc_movie_search(movie_name, target_date, theatre)
+
+    return findings
+
+
+async def _amc_direct_movie_page(
+    movie_slug: str, theatre: dict, movie_name: str, target_date: str
+) -> list[dict]:
+    """Check the known AMC movie page directly for showtime availability.
+
+    URL: https://www.amctheatres.com/movies/{slug}/showtimes?date={date}
+    This is the most reliable check — it's the official page for the movie.
+    """
+    theatre_slug = theatre.get("slug", "")
+    base_movie_url = f"https://www.amctheatres.com/movies/{movie_slug}/showtimes"
+    movie_url_with_date = f"{base_movie_url}?date={target_date}"
+
+    # Also try the theatre-specific URL pattern
+    urls_to_try = [movie_url_with_date]
+    if theatre_slug:
+        urls_to_try.append(f"{base_movie_url}/{theatre_slug}/{target_date}")
+
+    for url in urls_to_try:
+        log.info("Checking AMC direct movie page: %s", url)
+        try:
+            async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True) as client:
+                resp = await client.get(url, headers=BROWSER_HEADERS)
+                if resp.status_code != 200:
+                    log.warning("AMC direct movie page returned %s for %s", resp.status_code, url)
+                    continue
+
+                findings = _parse_amc_movie_page(resp.text, theatre, movie_name, target_date, movie_url_with_date)
+                if findings:
+                    return findings
+
+        except Exception as exc:
+            log.error("AMC direct movie page error for %s: %s", url, exc)
+
+    return []
+
+
+def _parse_amc_movie_page(
+    html: str, theatre: dict, movie_name: str, target_date: str, movie_url: str
+) -> list[dict]:
+    """Parse the AMC direct movie page for showtime availability.
+
+    The page at /movies/{slug}/showtimes?date={date} may contain:
+    - Embedded JSON with showtime data
+    - Theatre selection UI with showtimes per theatre
+    - "Get Tickets" / "Reserve" buttons if tickets are on sale
+    """
+    findings = []
+    theatre_name = theatre.get("name", "AMC Theatre")
+    theatre_slug = theatre.get("slug", "")
+    conf = cfg.get_config()
+    evening_hour = int(conf.get("evening_start_hour", 16))
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    # --- Strategy A: Look for embedded JSON with showtime data ---
+    for script in soup.find_all("script"):
+        script_text = script.string or ""
+        if not script_text.strip():
+            continue
+
+        # Look for preloaded state / next data / JSON-LD
+        for pattern in [
+            r'window\.__PRELOADED_STATE__\s*=\s*({.*?});?\s*$',
+            r'window\.__NEXT_DATA__\s*=\s*({.*?});?\s*$',
+        ]:
+            match = re.search(pattern, script_text, re.DOTALL | re.MULTILINE)
+            if match:
+                try:
+                    data = json.loads(match.group(1))
+                    showtimes = _extract_theatre_showtimes(data, theatre_slug, theatre_name, evening_hour)
+                    if showtimes:
+                        for st in showtimes:
+                            findings.append({
+                                "source": "amc_direct",
+                                "theatre_name": theatre_name,
+                                "movie_name": movie_name,
+                                "showtime": st.get("time", ""),
+                                "show_date": target_date,
+                                "ticket_url": st.get("url", movie_url),
+                            })
+                        return findings
+                except (json.JSONDecodeError, TypeError):
+                    continue
+
+        # Also check for JSON-LD structured data
+        if script.get("type") in ("application/ld+json", "application/json"):
+            try:
+                data = json.loads(script_text)
+                if isinstance(data, dict):
+                    # Check for screening event data
+                    event_type = data.get("@type", "")
+                    if "Event" in event_type or "Screening" in event_type:
+                        location = data.get("location", {})
+                        loc_name = location.get("name", "") if isinstance(location, dict) else ""
+                        if not theatre_slug or theatre_slug.replace("-", " ") in loc_name.lower().replace("-", " "):
+                            start = data.get("startDate", "")
+                            url = data.get("url", movie_url)
+                            findings.append({
+                                "source": "amc_direct",
+                                "theatre_name": loc_name or theatre_name,
+                                "movie_name": movie_name,
+                                "showtime": start,
+                                "show_date": target_date,
+                                "ticket_url": url,
+                            })
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    # --- Strategy B: Look for theatre name + showtime buttons in HTML ---
+    theatre_lower = theatre_name.lower()
+    theatre_words = set(theatre_slug.replace("-", " ").split()) if theatre_slug else set()
+
+    # Find all elements that could be showtime buttons/links
+    showtime_links = soup.find_all("a", href=re.compile(r"(order|ticket|checkout|showtime)", re.IGNORECASE))
+    for link in showtime_links:
+        # Check if this showtime is associated with our theatre
+        parent_text = ""
+        for parent in link.parents:
+            parent_text = parent.get_text(" ", strip=True).lower()
+            if theatre_lower in parent_text or (theatre_words and theatre_words.issubset(parent_text.split())):
+                break
+            # Don't go too far up
+            if parent.name in ("body", "html"):
+                parent_text = ""
+                break
+
+        if not parent_text:
+            continue
+
+        href = link.get("href", "")
+        link_text = link.get_text(strip=True)
+        ticket_url = f"https://www.amctheatres.com{href}" if href.startswith("/") else href
+
+        if _is_evening_time(link_text, evening_hour):
+            findings.append({
+                "source": "amc_direct",
+                "theatre_name": theatre_name,
+                "movie_name": movie_name,
+                "showtime": link_text,
+                "show_date": target_date,
+                "ticket_url": ticket_url or movie_url,
+            })
+
+    # --- Strategy C: Check if the page mentions the theatre at all ---
+    if not findings:
+        page_text = html.lower()
+        theatre_mentioned = theatre_lower in page_text or (
+            theatre_slug and theatre_slug.replace("-", " ") in page_text
+        )
+
+        # Look for "Get Tickets", "Reserve", "Buy" buttons
+        buy_buttons = soup.find_all(
+            ["a", "button"],
+            string=re.compile(r"(get ticket|buy ticket|reserve|select seat)", re.IGNORECASE),
+        )
+
+        if buy_buttons and theatre_mentioned:
+            btn = buy_buttons[0]
+            href = btn.get("href", "")
+            ticket_url = f"https://www.amctheatres.com{href}" if href and href.startswith("/") else movie_url
+            findings.append({
+                "source": "amc_direct",
+                "theatre_name": theatre_name,
+                "movie_name": movie_name,
+                "showtime": "Tickets available (check site for times)",
+                "show_date": target_date,
+                "ticket_url": ticket_url,
+            })
+
+    return findings
+
+
+def _extract_theatre_showtimes(
+    data: dict | list, theatre_slug: str, theatre_name: str, evening_hour: int
+) -> list[dict]:
+    """Recursively extract showtimes for a specific theatre from embedded JSON."""
+    results = []
+
+    if isinstance(data, dict):
+        # Check if this dict looks like a theatre or showtime object
+        d_name = (data.get("name", "") or data.get("theatreName", "") or "").lower()
+        d_slug = (data.get("slug", "") or data.get("theatreSlug", "") or "").lower()
+        d_id = str(data.get("theatreId", "") or data.get("id", ""))
+
+        is_our_theatre = (
+            (theatre_slug and theatre_slug in d_slug) or
+            (theatre_slug and theatre_slug.replace("-", " ") in d_name) or
+            (theatre_name.lower() in d_name)
+        )
+
+        if is_our_theatre:
+            # Found our theatre — look for showtimes within this subtree
+            inner_times = _extract_times_from_subtree(data, evening_hour)
+            results.extend(inner_times)
+
+        # Recurse
+        for v in data.values():
+            results.extend(_extract_theatre_showtimes(v, theatre_slug, theatre_name, evening_hour))
+
+    elif isinstance(data, list):
+        for item in data:
+            results.extend(_extract_theatre_showtimes(item, theatre_slug, theatre_name, evening_hour))
+
+    return results
+
+
+def _extract_times_from_subtree(data: dict | list, evening_hour: int) -> list[dict]:
+    """Extract showtime strings from a JSON subtree."""
+    results = []
+
+    if isinstance(data, dict):
+        time_str = (
+            data.get("showDateTimeLocal", "")
+            or data.get("startDate", "")
+            or data.get("performanceDateTime", "")
+            or data.get("showtime", "")
+        )
+        url = data.get("purchaseUrl", "") or data.get("url", "") or data.get("ticketUrl", "")
+
+        if time_str:
+            try:
+                dt = datetime.fromisoformat(time_str.replace("Z", "+00:00"))
+                if dt.hour >= evening_hour:
+                    results.append({"time": dt.strftime("%I:%M %p"), "url": url})
+            except Exception:
+                results.append({"time": time_str, "url": url})
+
+        for v in data.values():
+            results.extend(_extract_times_from_subtree(v, evening_hour))
+
+    elif isinstance(data, list):
+        for item in data:
+            results.extend(_extract_times_from_subtree(item, evening_hour))
+
+    return results
+
+
+async def _amc_developer_api(
+    theatre: dict, movie_name: str, target_date: str, api_key: str, vendor_id: str
+) -> list[dict]:
+    """Query the AMC Developer API for showtimes."""
+    theatre_id = theatre.get("theatre_id", "")
+    if not theatre_id:
+        return []
+
+    url = f"https://api.amctheatres.com/v2/theatres/{theatre_id}/showtimes/{target_date}"
+    headers = {
+        "X-AMC-Vendor-ID": vendor_id,
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code != 200:
+                log.warning("AMC API returned %s for theatre %s", resp.status_code, theatre_id)
+                return []
+
+            data = resp.json()
+            return _parse_amc_api_response(data, movie_name, theatre, target_date)
+    except Exception as exc:
+        log.error("AMC API error: %s", exc)
+        return []
+
+
+def _parse_amc_api_response(
+    data: dict, movie_name: str, theatre: dict, target_date: str
+) -> list[dict]:
+    """Parse the AMC Developer API showtime response."""
+    findings = []
+    movie_lower = movie_name.lower()
+    conf = cfg.get_config()
+    evening_hour = int(conf.get("evening_start_hour", 16))
+
+    showtimes = data.get("_embedded", {}).get("showtimes", [])
+    if not showtimes:
+        showtimes = data.get("showtimes", [])
+
+    for st in showtimes:
+        st_movie = st.get("movieName", "") or st.get("movie", {}).get("name", "")
+        if movie_lower not in st_movie.lower():
+            continue
+
+        showtime_str = st.get("showDateTimeLocal", "") or st.get("performanceDateTime", "")
+        # Filter for evening shows
+        try:
+            dt = datetime.fromisoformat(showtime_str.replace("Z", "+00:00"))
+            if dt.hour < evening_hour:
+                continue
+            nice_time = dt.strftime("%I:%M %p")
+        except Exception:
+            nice_time = showtime_str
+
+        purchase_url = st.get("purchaseUrl", "") or st.get("_links", {}).get("purchase", {}).get("href", "")
+
+        findings.append({
+            "source": "amc_api",
+            "theatre_name": theatre.get("name", "AMC Theatre"),
+            "movie_name": st_movie,
+            "showtime": nice_time,
+            "show_date": target_date,
+            "ticket_url": purchase_url,
+        })
+
+    return findings
+
+
+async def _amc_showtime_page(theatre: dict, movie_name: str, target_date: str) -> list[dict]:
+    """Scrape the AMC website showtime page for a specific theatre and date."""
+    slug = theatre.get("slug", "")
+    if not slug:
+        return []
+
+    url = f"https://www.amctheatres.com/showtimes/all/{target_date}/{slug}/all"
+    log.info("Checking AMC web: %s", url)
+
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True) as client:
+            resp = await client.get(url, headers=BROWSER_HEADERS)
+            if resp.status_code != 200:
+                log.warning("AMC web returned %s for %s", resp.status_code, slug)
+                return []
+
+            return _parse_amc_html(resp.text, movie_name, theatre, target_date, url)
+    except Exception as exc:
+        log.error("AMC web scraping error for %s: %s", slug, exc)
+        return []
+
+
+def _find_amc_movie_url(soup: BeautifulSoup, html: str, movie_lower: str, target_date: str) -> str:
+    """Extract the AMC movie-specific showtime URL from page HTML.
+
+    Looks for /movies/{slug} links whose text matches the movie name and builds:
+      https://www.amctheatres.com/movies/{slug}/showtimes?date={date}
+    """
+    # Strategy 1: <a> tags with /movies/ hrefs
+    for link in soup.find_all("a", href=re.compile(r"/movies/", re.IGNORECASE)):
+        href = link.get("href", "")
+        link_text = link.get_text(" ", strip=True).lower()
+        if movie_lower in link_text:
+            # href might be "/movies/dracula-81573" or full URL
+            slug = href.split("/movies/")[-1].split("/")[0].split("?")[0]
+            if slug:
+                return f"https://www.amctheatres.com/movies/{slug}/showtimes?date={target_date}"
+
+    # Strategy 2: regex scan for /movies/{slug} anywhere in raw HTML near the movie name
+    pattern = r'/movies/([\w-]+)'
+    for m in re.finditer(pattern, html):
+        slug = m.group(1)
+        # Check if the movie name words appear near this slug in the text
+        start = max(0, m.start() - 300)
+        end = min(len(html), m.end() + 300)
+        context = html[start:end].lower()
+        if movie_lower in context:
+            return f"https://www.amctheatres.com/movies/{slug}/showtimes?date={target_date}"
+
+    return ""
+
+
+def _parse_amc_html(
+    html: str, movie_name: str, theatre: dict, target_date: str, page_url: str
+) -> list[dict]:
+    """Parse AMC showtime page HTML for ticket availability."""
+    findings = []
+    movie_lower = movie_name.lower()
+    conf = cfg.get_config()
+    evening_hour = int(conf.get("evening_start_hour", 16))
+
+    # Strategy A: Look for embedded JSON (window.__PRELOADED_STATE__ or similar)
+    json_findings = _extract_embedded_json(html, movie_lower, theatre, target_date, evening_hour)
+    if json_findings:
+        return json_findings
+
+    # Strategy B: Parse HTML with BeautifulSoup
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Try to find the proper movie-specific URL first
+    movie_url = _find_amc_movie_url(soup, html, movie_lower, target_date) or page_url
+
+    # Look for movie titles and showtimes in the page
+    # AMC uses various class patterns — try multiple selectors
+    movie_sections = soup.find_all(
+        ["div", "section", "article"],
+        class_=re.compile(r"(showtime|movie|film)", re.IGNORECASE),
+    )
+
+    for section in movie_sections:
+        section_text = section.get_text(" ", strip=True).lower()
+        if movie_lower not in section_text:
+            continue
+
+        # Found the movie — look for showtime links/buttons
+        time_elements = section.find_all(
+            ["a", "button", "span", "time"],
+            class_=re.compile(r"(showtime|time|btn)", re.IGNORECASE),
+        )
+
+        for elem in time_elements:
+            time_text = elem.get_text(strip=True)
+            href = elem.get("href", "")
+            ticket_url = f"https://www.amctheatres.com{href}" if href and href.startswith("/") else href
+
+            # Try to parse the time
+            if _is_evening_time(time_text, evening_hour):
+                findings.append({
+                    "source": "amc_web",
+                    "theatre_name": theatre.get("name", "AMC Theatre"),
+                    "movie_name": movie_name,
+                    "showtime": time_text,
+                    "show_date": target_date,
+                    "ticket_url": ticket_url or movie_url,
+                })
+
+        # If we found the movie section but no specific times, still report it
+        if not time_elements:
+            findings.append({
+                "source": "amc_web",
+                "theatre_name": theatre.get("name", "AMC Theatre"),
+                "movie_name": movie_name,
+                "showtime": "Available (check site for times)",
+                "show_date": target_date,
+                "ticket_url": movie_url,
+            })
+
+    # Strategy C: Simple text search as last resort
+    if not findings and movie_lower in html.lower():
+        findings.append({
+            "source": "amc_web",
+            "theatre_name": theatre.get("name", "AMC Theatre"),
+            "movie_name": movie_name,
+            "showtime": "Detected on page (check site for details)",
+            "show_date": target_date,
+            "ticket_url": movie_url,
+        })
+
+    return findings
+
+
+def _extract_embedded_json(
+    html: str, movie_lower: str, theatre: dict, target_date: str, evening_hour: int
+) -> list[dict]:
+    """Try to extract showtime data from embedded JSON in script tags."""
+    findings = []
+
+    # Look for JSON embedded in script tags (common patterns)
+    patterns = [
+        r'window\.__PRELOADED_STATE__\s*=\s*({.*?});?\s*</script>',
+        r'window\.__NEXT_DATA__\s*=\s*({.*?});?\s*</script>',
+        r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>',
+        r'<script[^>]*type="application/json"[^>]*>(.*?)</script>',
+    ]
+
+    for pattern in patterns:
+        matches = re.findall(pattern, html, re.DOTALL)
+        for match in matches:
+            try:
+                data = json.loads(match)
+                # Recursively search for movie name in JSON
+                if _json_contains_movie(data, movie_lower):
+                    showtimes = _extract_showtimes_from_json(data, movie_lower, evening_hour)
+                    for st in showtimes:
+                        findings.append({
+                            "source": "amc_web_json",
+                            "theatre_name": theatre.get("name", "AMC Theatre"),
+                            "movie_name": st.get("movie_name", movie_lower.title()),
+                            "showtime": st.get("showtime", ""),
+                            "show_date": target_date,
+                            "ticket_url": st.get("ticket_url", ""),
+                        })
+                    if not showtimes:
+                        findings.append({
+                            "source": "amc_web_json",
+                            "theatre_name": theatre.get("name", "AMC Theatre"),
+                            "movie_name": movie_lower.title(),
+                            "showtime": "Found in page data",
+                            "show_date": target_date,
+                            "ticket_url": "",
+                        })
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+    return findings
+
+
+def _json_contains_movie(data, movie_lower: str) -> bool:
+    """Recursively check if JSON data contains the movie name."""
+    if isinstance(data, str):
+        return movie_lower in data.lower()
+    elif isinstance(data, dict):
+        return any(_json_contains_movie(v, movie_lower) for v in data.values())
+    elif isinstance(data, list):
+        return any(_json_contains_movie(item, movie_lower) for item in data)
+    return False
+
+
+def _extract_showtimes_from_json(data, movie_lower: str, evening_hour: int) -> list[dict]:
+    """Try to extract showtime information from parsed JSON."""
+    results = []
+
+    if isinstance(data, dict):
+        # Check if this dict represents a showtime
+        name = data.get("movieName", "") or data.get("name", "") or data.get("title", "")
+        if name and movie_lower in name.lower():
+            time_str = (
+                data.get("showDateTimeLocal", "")
+                or data.get("startDate", "")
+                or data.get("performanceDateTime", "")
+            )
+            url = data.get("purchaseUrl", "") or data.get("url", "")
+            if time_str:
+                results.append({
+                    "movie_name": name,
+                    "showtime": time_str,
+                    "ticket_url": url,
+                })
+
+        # Recurse into values
+        for v in data.values():
+            results.extend(_extract_showtimes_from_json(v, movie_lower, evening_hour))
+
+    elif isinstance(data, list):
+        for item in data:
+            results.extend(_extract_showtimes_from_json(item, movie_lower, evening_hour))
+
+    return results
+
+
+async def _amc_movie_search(movie_name: str, target_date: str, theatre: dict) -> list[dict]:
+    """Search AMC website for the movie."""
+    encoded = quote_plus(movie_name)
+    url = f"https://www.amctheatres.com/search?query={encoded}"
+    log.info("Searching AMC: %s", url)
+
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True) as client:
+            resp = await client.get(url, headers=BROWSER_HEADERS)
+            if resp.status_code != 200:
+                return []
+
+            movie_lower = movie_name.lower()
+            if movie_lower in resp.text.lower():
+                # Movie found in search — extract link
+                soup = BeautifulSoup(resp.text, "html.parser")
+                links = soup.find_all("a", href=re.compile(r"/movies/", re.IGNORECASE))
+                for link in links:
+                    if movie_lower in link.get_text().lower():
+                        href = link.get("href", "")
+                        # Extract slug and build a proper showtime URL
+                        slug = href.split("/movies/")[-1].split("/")[0].split("?")[0]
+                        if slug:
+                            movie_url = f"https://www.amctheatres.com/movies/{slug}/showtimes?date={target_date}"
+                        else:
+                            movie_url = href if href.startswith("http") else f"https://www.amctheatres.com{href}"
+                        return [{
+                            "source": "amc_search",
+                            "theatre_name": theatre.get("name", "AMC"),
+                            "movie_name": movie_name,
+                            "showtime": "Movie found — check for showtimes",
+                            "show_date": target_date,
+                            "ticket_url": movie_url,
+                        }]
+    except Exception as exc:
+        log.error("AMC search error: %s", exc)
+
+    return []
+
+
+# ===========================================================================
+# Fandango Checker
+# ===========================================================================
+
+async def check_fandango(theatre: dict, movie_name: str, target_date: str) -> list[dict]:
+    """Check Fandango for ticket availability."""
+    findings: list[dict] = []
+
+    # Strategy 1: Fandango movie search
+    findings = await _fandango_movie_search(movie_name, target_date, theatre)
+    if findings:
+        return findings
+
+    # Strategy 2: Fandango theatre page
+    findings = await _fandango_theatre_page(theatre, movie_name, target_date)
+
+    return findings
+
+
+async def _fandango_movie_search(movie_name: str, target_date: str, theatre: dict) -> list[dict]:
+    """Search Fandango for the movie."""
+    findings = []
+    encoded = quote_plus(movie_name)
+    conf = cfg.get_config()
+    movie_year = conf.get("movie_year", "2026")
+
+    # Try the autocomplete/search API first
+    search_url = f"https://www.fandango.com/nw/csx/mango/search/util/autocomplete/movies?q={encoded}"
+    log.info("Searching Fandango autocomplete: %s", search_url)
+
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True) as client:
+            resp = await client.get(search_url, headers={
+                **BROWSER_HEADERS,
+                "Accept": "application/json, text/plain, */*",
+                "Referer": "https://www.fandango.com/",
+            })
+
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    movie_lower = movie_name.lower()
+
+                    # Parse autocomplete results
+                    movies = data if isinstance(data, list) else data.get("movies", [])
+                    for m in movies:
+                        m_name = m.get("name", "") or m.get("title", "")
+                        m_year = str(m.get("year", ""))
+                        if movie_lower in m_name.lower() and (not movie_year or m_year == movie_year):
+                            m_url = m.get("url", "") or m.get("link", "")
+                            if m_url and not m_url.startswith("http"):
+                                m_url = f"https://www.fandango.com{m_url}"
+                            # Rewrite /movie-overview to /movie-times with date
+                            m_url = re.sub(r"/movie-overview$", f"/movie-times?date={target_date}", m_url)
+                            if "/movie-times" not in m_url and m_url:
+                                m_url = m_url.rstrip("/") + f"/movie-times?date={target_date}"
+                            findings.append({
+                                "source": "fandango_search",
+                                "theatre_name": theatre.get("name", "Theatre"),
+                                "movie_name": m_name,
+                                "showtime": "Movie found — check for showtimes",
+                                "show_date": target_date,
+                                "ticket_url": m_url,
+                            })
+                except (json.JSONDecodeError, TypeError):
+                    pass
+    except Exception as exc:
+        log.error("Fandango autocomplete error: %s", exc)
+
+    # Also try the HTML search page
+    if not findings:
+        search_page_url = f"https://www.fandango.com/search?q={encoded}&mode=movies"
+        log.info("Searching Fandango web: %s", search_page_url)
+
+        try:
+            async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True) as client:
+                resp = await client.get(search_page_url, headers=BROWSER_HEADERS)
+                if resp.status_code == 200:
+                    movie_lower = movie_name.lower()
+                    if movie_lower in resp.text.lower():
+                        soup = BeautifulSoup(resp.text, "html.parser")
+
+                        # Look for movie result links
+                        result_links = soup.find_all("a", href=re.compile(r"/movie-overview|/movie-times"))
+                        for link in result_links:
+                            if movie_lower in link.get_text().lower():
+                                href = link.get("href", "")
+                                m_url = href if href.startswith("http") else f"https://www.fandango.com{href}"
+
+                                # Check if it's the right year (avoid 2025 Dhurandhar)
+                                link_text = link.get_text().lower()
+                                if movie_year and movie_year not in link_text and "2025" in link_text:
+                                    continue
+
+                                # Rewrite /movie-overview to /movie-times with date
+                                m_url = re.sub(r"/movie-overview$", f"/movie-times?date={target_date}", m_url)
+
+                                findings.append({
+                                    "source": "fandango_search",
+                                    "theatre_name": theatre.get("name", "Theatre"),
+                                    "movie_name": movie_name,
+                                    "showtime": "Movie found on Fandango",
+                                    "show_date": target_date,
+                                    "ticket_url": m_url,
+                                })
+                                break
+        except Exception as exc:
+            log.error("Fandango web search error: %s", exc)
+
+    return findings
+
+
+async def _fandango_theatre_page(theatre: dict, movie_name: str, target_date: str) -> list[dict]:
+    """Check the Fandango theatre page for the movie's showtimes."""
+    slug = theatre.get("slug", "")
+    if not slug:
+        return []
+
+    url = f"https://www.fandango.com/{slug}/theater-page?date={target_date}"
+    log.info("Checking Fandango theatre page: %s", url)
+
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True) as client:
+            resp = await client.get(url, headers=BROWSER_HEADERS)
+            if resp.status_code != 200:
+                log.warning("Fandango theatre page returned %s for %s", resp.status_code, slug)
+                return []
+
+            return _parse_fandango_theatre_html(resp.text, movie_name, theatre, target_date, url)
+    except Exception as exc:
+        log.error("Fandango theatre page error: %s", exc)
+        return []
+
+
+def _parse_fandango_theatre_html(
+    html: str, movie_name: str, theatre: dict, target_date: str, page_url: str
+) -> list[dict]:
+    """Parse Fandango theatre page for movie showtimes."""
+    findings = []
+    movie_lower = movie_name.lower()
+    conf = cfg.get_config()
+    evening_hour = int(conf.get("evening_start_hour", 16))
+    movie_year = conf.get("movie_year", "2026")
+
+    # Check if movie appears on this page at all
+    if movie_lower not in html.lower():
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Try to find embedded JSON data first
+    scripts = soup.find_all("script", type=re.compile(r"application/(ld\+)?json"))
+    for script in scripts:
+        try:
+            data = json.loads(script.string or "")
+            if _json_contains_movie(data, movie_lower):
+                return [{
+                    "source": "fandango_web",
+                    "theatre_name": theatre.get("name", "Theatre"),
+                    "movie_name": movie_name,
+                    "showtime": "Showtimes available",
+                    "show_date": target_date,
+                    "ticket_url": page_url,
+                }]
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    # Parse HTML for movie sections
+    movie_items = soup.find_all(
+        ["div", "li", "section", "article"],
+        class_=re.compile(r"(movie|film|showtime|listing)", re.IGNORECASE),
+    )
+
+    for item in movie_items:
+        item_text = item.get_text(" ", strip=True).lower()
+        if movie_lower not in item_text:
+            continue
+
+        # Avoid matching 2025 version
+        if "2025" in item_text and movie_year and movie_year != "2025":
+            continue
+
+        # Found it — look for times
+        time_links = item.find_all(
+            ["a", "button", "span"],
+            class_=re.compile(r"(time|showtime|btn)", re.IGNORECASE),
+        )
+
+        for tl in time_links:
+            time_text = tl.get_text(strip=True)
+            href = tl.get("href", "")
+            ticket_url = href if href.startswith("http") else f"https://www.fandango.com{href}" if href else page_url
+
+            if _is_evening_time(time_text, evening_hour):
+                findings.append({
+                    "source": "fandango_web",
+                    "theatre_name": theatre.get("name", "Theatre"),
+                    "movie_name": movie_name,
+                    "showtime": time_text,
+                    "show_date": target_date,
+                    "ticket_url": ticket_url,
+                })
+
+        if not time_links:
+            findings.append({
+                "source": "fandango_web",
+                "theatre_name": theatre.get("name", "Theatre"),
+                "movie_name": movie_name,
+                "showtime": "Showtimes available (check site)",
+                "show_date": target_date,
+                "ticket_url": page_url,
+            })
+
+    # Last resort: movie name found in raw HTML
+    if not findings:
+        findings.append({
+            "source": "fandango_web",
+            "theatre_name": theatre.get("name", "Theatre"),
+            "movie_name": movie_name,
+            "showtime": "Detected on page (check site for details)",
+            "show_date": target_date,
+            "ticket_url": page_url,
+        })
+
+    return findings
+
+
+# ===========================================================================
+# Utilities
+# ===========================================================================
+
+def _is_evening_time(text: str, evening_hour: int = 16) -> bool:
+    """Check if a time string represents an evening showtime."""
+    text = text.strip().upper()
+
+    # Match common time formats: "6:00 PM", "18:00", "6:00pm", etc.
+    pm_match = re.search(r"(\d{1,2}):?(\d{2})?\s*(PM|AM)", text, re.IGNORECASE)
+    if pm_match:
+        hour = int(pm_match.group(1))
+        ampm = pm_match.group(3).upper()
+        if ampm == "PM" and hour != 12:
+            hour += 12
+        elif ampm == "AM" and hour == 12:
+            hour = 0
+        return hour >= evening_hour
+
+    # 24-hour format
+    h24_match = re.search(r"(\d{2}):(\d{2})", text)
+    if h24_match:
+        hour = int(h24_match.group(1))
+        return hour >= evening_hour
+
+    # If we can't parse, include it (better to over-report than miss)
+    return True
+
+
+# ===========================================================================
+# Main check orchestrator
+# ===========================================================================
+
+async def run_all_checks() -> tuple[list[dict], list[str], str]:
+    """Run checks across all configured theatres and sources.
+
+    Returns (findings, sources_checked, details_summary).
+    """
+    conf = cfg.get_config()
+    movie_name = conf.get("movie_name", "Dhurandhar Revenge")
+    target_date = conf.get("target_date", "2026-03-19")
+    theatres = cfg.get_theatres()
+
+    all_findings: list[dict] = []
+    sources_checked: list[str] = []
+    details_lines: list[str] = []
+
+    for theatre in theatres:
+        source = theatre.get("source", "amc")
+        theatre_name = theatre.get("name", "Unknown")
+        log.info("Checking %s (%s) for '%s' on %s", theatre_name, source, movie_name, target_date)
+
+        try:
+            if source == "amc":
+                findings = await check_amc(theatre, movie_name, target_date)
+                sources_checked.append(f"amc:{theatre_name}")
+            elif source == "fandango":
+                findings = await check_fandango(theatre, movie_name, target_date)
+                sources_checked.append(f"fandango:{theatre_name}")
+            else:
+                log.warning("Unknown source: %s", source)
+                continue
+
+            all_findings.extend(findings)
+
+            if findings:
+                details_lines.append(f"✅ {theatre_name}: {len(findings)} result(s) found")
+                for f in findings:
+                    details_lines.append(f"   • {f.get('showtime', 'N/A')} — {f.get('ticket_url', 'N/A')}")
+            else:
+                details_lines.append(f"❌ {theatre_name}: No tickets found")
+
+        except Exception as exc:
+            log.error("Error checking %s: %s", theatre_name, exc)
+            details_lines.append(f"⚠️ {theatre_name}: Error — {exc}")
+            sources_checked.append(f"{source}:{theatre_name} (error)")
+
+    details = "\n".join(details_lines)
+    return all_findings, sources_checked, details
