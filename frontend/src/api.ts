@@ -6,13 +6,31 @@ const API_URL = import.meta.env.VITE_API_URL || "";
 const BASE = `${API_URL}/api`;
 
 async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${BASE}${url}`, {
-    headers: { "Content-Type": "application/json" },
-    ...init,
-  });
+  const fullUrl = `${BASE}${url}`;
+  let res: Response;
+  try {
+    res = await fetch(fullUrl, {
+      headers: { "Content-Type": "application/json" },
+      ...init,
+    });
+  } catch (e) {
+    throw new Error(
+      API_URL
+        ? `Cannot reach backend at ${API_URL}. Is it running?`
+        : "Backend URL not configured. Set VITE_API_URL environment variable."
+    );
+  }
   if (!res.ok) {
     const body = await res.text();
-    throw new Error(`API ${res.status}: ${body}`);
+    throw new Error(`API ${res.status}: ${body.slice(0, 200)}`);
+  }
+  const contentType = res.headers.get("content-type") || "";
+  if (!contentType.includes("application/json")) {
+    throw new Error(
+      API_URL
+        ? `Backend returned HTML instead of JSON. Check VITE_API_URL (${API_URL}).`
+        : "Got HTML instead of JSON. Set VITE_API_URL to your Railway backend URL."
+    );
   }
   return res.json();
 }
