@@ -52,6 +52,8 @@ export interface BotConfig {
   amc_api_key: string;
   amc_vendor_id: string;
   amc_movie_slug: string;
+  purchase_theatre: string;
+  num_tickets: number;
   evening_start_hour: number;
   theatres: Theatre[];
 }

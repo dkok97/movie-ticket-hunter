@@ -140,6 +140,8 @@ class ConfigUpdate(BaseModel):
     amc_api_key: str | None = None
     amc_vendor_id: str | None = None
     amc_movie_slug: str | None = None
+    purchase_theatre: str | None = None
+    num_tickets: int | None = None
     evening_start_hour: int | None = None
     theatres: list[dict] | None = None
 

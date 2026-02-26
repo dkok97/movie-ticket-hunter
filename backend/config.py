@@ -22,6 +22,8 @@ DEFAULT_CONFIG: dict = {
     "amc_api_key": os.getenv("AMC_API_KEY", ""),
     "amc_vendor_id": os.getenv("AMC_VENDOR_ID", ""),
     "amc_movie_slug": "dhurandhar-the-revenge-83029",  # from amctheatres.com/movies/{slug}
+    "purchase_theatre": "AMC Empire 25",  # theatre to highlight with 1-click purchase links
+    "num_tickets": 2,  # number of tickets to buy
     "evening_start_hour": 16,  # 4 PM and later = evening show
     "theatres": json.dumps([
         {

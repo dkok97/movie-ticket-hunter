@@ -110,6 +110,48 @@ export default function ConfigPanel({ config, onSave, onRefresh }: Props) {
         </div>
       </div>
 
+      {/* Purchase Settings */}
+      <div className="card">
+        <div className="flex items-center gap-3 mb-6">
+          <span className="text-xl">🛒</span>
+          <h2 className="text-lg font-semibold text-slate-200">1-Click Purchase</h2>
+        </div>
+
+        <div className="bg-cinema-800/60 rounded-xl p-4 border border-cinema-600/30 mb-4">
+          <p className="text-sm text-slate-400">
+            <strong className="text-slate-300">How it works:</strong> When tickets are found at your
+            priority theatre, you'll get a <strong className="text-emerald-400">max-priority</strong> notification
+            with a <strong className="text-gold-400">BUY NOW</strong> button that opens the AMC purchase page instantly.
+          </p>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <Field label="Priority Theatre (for purchase alerts)">
+            <select
+              className="input-field"
+              value={form.purchase_theatre ?? "AMC Empire 25"}
+              onChange={(e) => handleChange("purchase_theatre", e.target.value)}
+            >
+              {theatres.map((t, idx) => (
+                <option key={idx} value={t.name}>
+                  {t.name}
+                </option>
+              ))}
+            </select>
+          </Field>
+          <Field label="Number of Tickets">
+            <input
+              className="input-field"
+              type="number"
+              min={1}
+              max={20}
+              value={form.num_tickets ?? 2}
+              onChange={(e) => handleChange("num_tickets", parseInt(e.target.value) || 2)}
+            />
+          </Field>
+        </div>
+      </div>
+
       {/* Bot Settings */}
       <div className="card">
         <div className="flex items-center gap-3 mb-6">
