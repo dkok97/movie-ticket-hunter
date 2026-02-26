@@ -15,7 +15,7 @@ DEFAULT_CONFIG: dict = {
     "movie_name": "Dhurandhar Revenge",
     "movie_year": "2026",
     "target_date": "2026-03-19",
-    "poll_interval_minutes": 1,
+    "poll_interval_minutes": 2,
     "ntfy_topic": os.getenv("NTFY_TOPIC", "dhurandhar-tickets"),
     "ntfy_server": os.getenv("NTFY_SERVER", "https://ntfy.sh"),
     "notifications_enabled": True,
@@ -23,7 +23,7 @@ DEFAULT_CONFIG: dict = {
     "amc_vendor_id": os.getenv("AMC_VENDOR_ID", ""),
     "amc_movie_slug": "dhurandhar-the-revenge-83029",  # from amctheatres.com/movies/{slug}
     "purchase_theatre": "AMC Empire 25",  # theatre to highlight with 1-click purchase links
-    "num_tickets": 2,  # number of tickets to buy
+    "num_tickets": 4,  # number of tickets to buy
     "evening_start_hour": 16,  # 4 PM and later = evening show
     "theatres": json.dumps([
         {
