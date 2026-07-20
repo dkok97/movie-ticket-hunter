@@ -47,11 +47,17 @@ TIMEOUT = httpx.Timeout(20.0, connect=10.0)
 async def check_amc(theatre: dict, movie_name: str, target_date: str) -> list[dict]:
     """Check AMC for ticket availability.
 
-    When an AMC Developer API key is configured, the official API is the
-    authoritative source (clean JSON, and it bypasses AMC's Queue-it anti-bot
-    waiting room that intercepts the public website). We only fall back to web
-    scraping if the API call itself errors — an *empty* API result means
-    "genuinely no open seats", not "try scraping instead".
+    Order (each falls through to the next only if it finds nothing):
+      0. AMC Developer API — authoritative when the key works (empty = truly
+         no seats, so we return it and stop).
+      1. Plain-HTTP movie page — proven to return real showtime data for this
+         movie/theatre, and it's fast (no browser overhead).
+      2. Headless browser — fallback for when plain HTTP is blocked by Queue-it
+         or the page is only rendered client-side.
+      3. Other web strategies.
+
+    Critically, an empty result from the browser is NOT terminal — we keep
+    trying the remaining strategies so one flaky path can't zero out a cycle.
     """
     conf = cfg.get_config()
     api_key = conf.get("amc_api_key", "")
@@ -64,23 +70,19 @@ async def check_amc(theatre: dict, movie_name: str, target_date: str) -> list[di
         api_findings = await _amc_developer_api(theatre, movie_name, target_date, api_key, vendor_id)
         if api_findings is not None:
             return api_findings  # authoritative, even when empty
-        log.warning("AMC API unavailable for %s — falling back to browser/scraping", target_date)
+        log.warning("AMC API unavailable for %s — falling back to web scraping", target_date)
 
-    # Strategy 1 (preferred fallback): headless browser — defeats Queue-it and
-    # the client-side rendering that make plain HTTP scraping useless.
-    if use_browser and movie_slug:
-        findings = await _amc_browser_movie_page(movie_slug, theatre, movie_name, target_date)
-        if findings:
-            findings = await _enrich_findings_with_seats(findings, _browser_fetch_open_seats)
-        return findings
-
-    findings: list[dict] = []
-
-    # Strategy 2: Direct AMC movie page via plain HTTP (unreliable behind Queue-it)
+    # Strategy 1: plain-HTTP movie page (fast, and proven to work for this page).
     if movie_slug:
         findings = await _amc_direct_movie_page(movie_slug, theatre, movie_name, target_date)
         if findings:
             return findings
+
+    # Strategy 2: headless browser fallback (defeats Queue-it / client rendering).
+    if use_browser and movie_slug:
+        findings = await _amc_browser_movie_page(movie_slug, theatre, movie_name, target_date)
+        if findings:
+            return await _enrich_findings_with_seats(findings, _browser_fetch_open_seats)
 
     # Strategy 3: AMC web — showtime page
     findings = await _amc_showtime_page(theatre, movie_name, target_date)
@@ -88,9 +90,7 @@ async def check_amc(theatre: dict, movie_name: str, target_date: str) -> list[di
         return findings
 
     # Strategy 4: AMC web — movie search
-    findings = await _amc_movie_search(movie_name, target_date, theatre)
-
-    return findings
+    return await _amc_movie_search(movie_name, target_date, theatre)
 
 
 async def _amc_direct_movie_page(
