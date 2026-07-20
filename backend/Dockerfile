@@ -1,4 +1,8 @@
-FROM python:3.12-slim
+# Pin to Debian 12 (bookworm). The unpinned python:3.12-slim now resolves to
+# Debian 13 (trixie), which Playwright 1.49 doesn't recognize — it falls back
+# to Ubuntu 20.04 package names (ttf-unifont, ttf-ubuntu-font-family) that don't
+# exist on trixie, breaking `playwright install --with-deps`.
+FROM python:3.12-slim-bookworm
 
 WORKDIR /app
 
