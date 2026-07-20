@@ -45,23 +45,31 @@ TIMEOUT = httpx.Timeout(20.0, connect=10.0)
 # ===========================================================================
 
 async def check_amc(theatre: dict, movie_name: str, target_date: str) -> list[dict]:
-    """Check AMC for ticket availability. Tries direct movie page first, then other strategies."""
+    """Check AMC for ticket availability.
+
+    When an AMC Developer API key is configured, the official API is the
+    authoritative source (clean JSON, and it bypasses AMC's Queue-it anti-bot
+    waiting room that intercepts the public website). We only fall back to web
+    scraping if the API call itself errors — an *empty* API result means
+    "genuinely no open seats", not "try scraping instead".
+    """
     conf = cfg.get_config()
     api_key = conf.get("amc_api_key", "")
     vendor_id = conf.get("amc_vendor_id", "")
     movie_slug = conf.get("amc_movie_slug", "")
 
+    # Strategy 0 (preferred): AMC Developer API.
+    if api_key:
+        api_findings = await _amc_developer_api(theatre, movie_name, target_date, api_key, vendor_id)
+        if api_findings is not None:
+            return api_findings  # authoritative, even when empty
+        log.warning("AMC API unavailable for %s — falling back to web scraping", target_date)
+
     findings: list[dict] = []
 
-    # Strategy 0 (priority): Direct AMC movie page (if slug is configured)
+    # Strategy 1: Direct AMC movie page (if slug is configured)
     if movie_slug:
         findings = await _amc_direct_movie_page(movie_slug, theatre, movie_name, target_date)
-        if findings:
-            return findings
-
-    # Strategy 1: AMC Developer API (if credentials provided)
-    if api_key and vendor_id:
-        findings = await _amc_developer_api(theatre, movie_name, target_date, api_key, vendor_id)
         if findings:
             return findings
 
@@ -337,53 +345,140 @@ def _extract_times_from_subtree(data: dict | list, evening_hour: int) -> list[di
 
 async def _amc_developer_api(
     theatre: dict, movie_name: str, target_date: str, api_key: str, vendor_id: str
-) -> list[dict]:
-    """Query the AMC Developer API for showtimes."""
+) -> list[dict] | None:
+    """Query the AMC Developer API for showtimes.
+
+    Returns a list of findings on success (possibly empty = no open seats),
+    or None if the request failed (so the caller can fall back to scraping).
+
+    Auth is a single ``X-AMC-Vendor-Key`` header. ``vendor_id`` is unused for
+    catalog calls but kept for backward compatibility.
+    """
     theatre_id = theatre.get("theatre_id", "")
     if not theatre_id:
-        return []
+        log.warning("AMC API: theatre %r has no theatre_id; cannot use API", theatre.get("name"))
+        return None
 
-    url = f"https://api.amctheatres.com/v2/theatres/{theatre_id}/showtimes/{target_date}"
     headers = {
-        "X-AMC-Vendor-ID": vendor_id,
-        "Authorization": f"Bearer {api_key}",
+        "X-AMC-Vendor-Key": api_key,
         "Accept": "application/json",
     }
+    # Large pageSize to minimise pagination; still follow next links as a safety net.
+    url = f"https://api.amctheatres.com/v2/theatres/{theatre_id}/showtimes/{target_date}?pageSize=100"
 
+    all_showtimes: list[dict] = []
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-            resp = await client.get(url, headers=headers)
-            if resp.status_code != 200:
-                log.warning("AMC API returned %s for theatre %s", resp.status_code, theatre_id)
-                return []
+            for _ in range(20):  # hard page cap
+                resp = await client.get(url, headers=headers)
+                if resp.status_code in (401, 403):
+                    log.error(
+                        "AMC API auth rejected (%s) — check AMC_API_KEY (X-AMC-Vendor-Key)",
+                        resp.status_code,
+                    )
+                    return None
+                if resp.status_code == 404:
+                    # No showtimes published for this theatre/date — a valid empty result.
+                    return []
+                if resp.status_code != 200:
+                    log.warning(
+                        "AMC API returned %s for theatre %s date %s",
+                        resp.status_code, theatre_id, target_date,
+                    )
+                    return None
 
-            data = resp.json()
-            return _parse_amc_api_response(data, movie_name, theatre, target_date)
+                data = resp.json()
+                page = data.get("_embedded", {}).get("showtimes", []) or data.get("showtimes", [])
+                all_showtimes.extend(page)
+
+                links = data.get("_links", {}) or {}
+                nxt = links.get("next", {})
+                next_href = nxt.get("href", "") if isinstance(nxt, dict) else ""
+                if not next_href:
+                    break
+                url = next_href
+
+            findings = _parse_amc_api_response(
+                {"_embedded": {"showtimes": all_showtimes}}, movie_name, theatre, target_date
+            )
+            # Enrich with seat-level detail (best effort) while the client is open.
+            if findings:
+                findings = await _enrich_findings_with_seats(findings, theatre_id, api_key, client)
     except Exception as exc:
-        log.error("AMC API error: %s", exc)
-        return []
+        log.error("AMC API error for %s: %s", target_date, exc)
+        return None
+
+    log.info(
+        "AMC API %s: %d showtime(s) at theatre, %d open %s match(es)",
+        target_date, len(all_showtimes), len(findings), cfg.get("movie_format", "") or "movie",
+    )
+    return findings
+
+
+def _amc_api_purchase_url(st: dict) -> str:
+    """Best purchase/seat-selection URL for an API showtime object."""
+    links = st.get("_links", {}) or {}
+    # Any HAL rel that looks like a purchase link.
+    for rel, val in links.items():
+        if "purchase" in rel.lower() or "ticket" in rel.lower():
+            if isinstance(val, dict) and val.get("href"):
+                return val["href"]
+            if isinstance(val, list) and val and isinstance(val[0], dict) and val[0].get("href"):
+                return val[0]["href"]
+    # Fallback: build the website seat-selection URL from the performance id.
+    st_id = st.get("id", "")
+    if st_id:
+        return f"https://www.amctheatres.com/showtimes/{st_id}/seats"
+    return "https://www.amctheatres.com"
 
 
 def _parse_amc_api_response(
     data: dict, movie_name: str, theatre: dict, target_date: str
 ) -> list[dict]:
-    """Parse the AMC Developer API showtime response."""
+    """Parse the AMC Developer API showtime response.
+
+    Filters to the target movie, drops sold-out showtimes, and requires the
+    premium format (e.g. IMAX 70mm) to match the showtime's attributes.
+    """
     findings = []
     movie_lower = movie_name.lower()
     conf = cfg.get_config()
     evening_hour = int(conf.get("evening_start_hour", 16))
+    movie_format = conf.get("movie_format", "")
 
     showtimes = data.get("_embedded", {}).get("showtimes", [])
     if not showtimes:
         showtimes = data.get("showtimes", [])
 
     for st in showtimes:
-        st_movie = st.get("movieName", "") or st.get("movie", {}).get("name", "")
+        st_movie = st.get("movieName", "") or (st.get("movie", {}) or {}).get("name", "")
         if movie_lower not in st_movie.lower():
             continue
 
-        showtime_str = st.get("showDateTimeLocal", "") or st.get("performanceDateTime", "")
-        # Filter for evening shows
+        # Skip sold-out / cancelled shows — we only want bookable seats.
+        # (isAlmostSoldOut still has seats, so it is kept.)
+        if st.get("isSoldOut") is True or st.get("isCanceled") is True:
+            continue
+
+        # Require the premium format. AMC exposes it via the attributes list.
+        attrs = st.get("attributes", []) or []
+        attr_text = " ".join(filter(None, [
+            st_movie,
+            st.get("premiumFormat", "") if isinstance(st.get("premiumFormat"), str) else "",
+            " ".join(
+                f"{a.get('code', '')} {a.get('name', '')} {a.get('description', '')}"
+                for a in attrs if isinstance(a, dict)
+            ),
+        ]))
+        if not _matches_format(attr_text, movie_format):
+            continue
+
+        showtime_str = (
+            st.get("showDateTimeLocal", "")
+            or st.get("showDateTimeUtc", "")
+            or st.get("performanceDateTime", "")
+        )
+        # Filter for evening shows (evening_start_hour=0 keeps everything)
         try:
             dt = datetime.fromisoformat(showtime_str.replace("Z", "+00:00"))
             if dt.hour < evening_hour:
@@ -392,7 +487,7 @@ def _parse_amc_api_response(
         except Exception:
             nice_time = showtime_str
 
-        purchase_url = st.get("purchaseUrl", "") or st.get("_links", {}).get("purchase", {}).get("href", "")
+        purchase_url = _amc_api_purchase_url(st)
 
         findings.append({
             "source": "amc_api",
@@ -401,9 +496,175 @@ def _parse_amc_api_response(
             "showtime": nice_time,
             "show_date": target_date,
             "ticket_url": purchase_url,
+            "format": movie_format,
+            "available": True,
+            "showtime_id": str(st.get("id", "")),
         })
 
     return findings
+
+
+# ===========================================================================
+# Seat-level availability (AMC API)
+# ===========================================================================
+
+# Seat types/labels we treat as accessible and want to avoid.
+ACCESSIBLE_SEAT_RE = re.compile(
+    r"wheel\s*chair|companion|accessible|handicap|\bada\b", re.IGNORECASE
+)
+
+
+def _seat_label(seat: dict) -> str:
+    return str(seat.get("name") or seat.get("label") or seat.get("id") or "").strip()
+
+
+def _seat_is_accessible(seat: dict) -> bool:
+    hay = " ".join(
+        str(seat.get(k, "")) for k in ("type", "seatType", "name", "description", "category")
+    )
+    if ACCESSIBLE_SEAT_RE.search(hay):
+        return True
+    for k in ("isWheelchair", "wheelchair", "isCompanion", "companion",
+              "isAccessible", "accessible", "isHandicap"):
+        if seat.get(k) is True:
+            return True
+    return False
+
+
+def _seat_is_available(seat: dict):
+    """True/False if determinable, else None."""
+    for k in ("available", "isAvailable", "open", "isOpen"):
+        if isinstance(seat.get(k), bool):
+            return seat[k]
+    status = str(
+        seat.get("status", "") or seat.get("state", "") or seat.get("seatStatus", "")
+    ).lower()
+    if status:
+        if any(w in status for w in ("avail", "open", "free", "empty")):
+            return True
+        if any(w in status for w in ("taken", "sold", "occupied", "unavail", "reserved", "broken", "blocked", "held")):
+            return False
+    for k in ("isTaken", "taken", "sold", "occupied", "reserved"):
+        if isinstance(seat.get(k), bool):
+            return not seat[k]
+    return None
+
+
+def _collect_seats(data) -> list[dict]:
+    """Recursively find seat-like dicts in a seat-availability response."""
+    seats: list[dict] = []
+    if isinstance(data, dict):
+        label = data.get("name") or data.get("label") or data.get("id")
+        looks_like_seat = bool(label) and any(
+            k in data for k in (
+                "available", "isAvailable", "status", "seatStatus", "isTaken",
+                "type", "seatType", "rowIndex", "columnIndex",
+            )
+        )
+        if looks_like_seat and isinstance(label, (str, int)):
+            seats.append(data)
+        for v in data.values():
+            seats.extend(_collect_seats(v))
+    elif isinstance(data, list):
+        for item in data:
+            seats.extend(_collect_seats(item))
+    return seats
+
+
+async def _amc_fetch_open_seats(
+    theatre_id: str, showtime_id: str, api_key: str, client: httpx.AsyncClient
+) -> tuple[list[str], list[str]] | None:
+    """Return (open_standard_labels, open_accessible_labels) or None if unavailable.
+
+    Tries a couple of plausible AMC seat-availability endpoints. Seat-level data
+    may be part of AMC's restricted ecommerce API, so this degrades gracefully
+    to None when the key isn't permitted.
+    """
+    if not showtime_id:
+        return None
+
+    urls = [
+        f"https://api.amctheatres.com/v2/theatres/{theatre_id}/showtimes/{showtime_id}/seats",
+        f"https://api.amctheatres.com/v2/showtimes/{showtime_id}/seats",
+    ]
+    headers = {"X-AMC-Vendor-Key": api_key, "Accept": "application/json"}
+
+    for url in urls:
+        try:
+            resp = await client.get(url, headers=headers)
+        except Exception as exc:
+            log.warning("AMC seat fetch error for showtime %s: %s", showtime_id, exc)
+            return None
+        if resp.status_code in (401, 403):
+            log.warning(
+                "AMC seat data not permitted for this key (%s) — reporting showtime without seat detail",
+                resp.status_code,
+            )
+            return None
+        if resp.status_code == 404:
+            continue  # try next URL shape
+        if resp.status_code != 200:
+            return None
+        try:
+            data = resp.json()
+        except Exception:
+            return None
+
+        seats = _collect_seats(data)
+        if not seats:
+            return None
+        open_std, open_acc = [], []
+        for s in seats:
+            if _seat_is_available(s) is not True:
+                continue
+            (open_acc if _seat_is_accessible(s) else open_std).append(_seat_label(s))
+        return open_std, open_acc
+
+    return None
+
+
+async def _enrich_findings_with_seats(
+    findings: list[dict], theatre_id: str, api_key: str, client: httpx.AsyncClient
+) -> list[dict]:
+    """Attach seat detail to findings and drop shows with no non-accessible seats.
+
+    Controlled by config: report_seats (default on) and exclude_accessible_seats
+    (default on). If seat data can't be retrieved, findings are kept as-is.
+    """
+    conf = cfg.get_config()
+    report_seats = str(conf.get("report_seats", True)).lower() not in ("false", "0", "no")
+    exclude_accessible = str(conf.get("exclude_accessible_seats", True)).lower() not in ("false", "0", "no")
+    if not report_seats:
+        return findings
+
+    kept: list[dict] = []
+    for f in findings:
+        result = await _amc_fetch_open_seats(theatre_id, f.get("showtime_id", ""), api_key, client)
+        if result is None:
+            # Seat detail unavailable — keep the finding, just no seat list.
+            f["seat_summary"] = ""
+            kept.append(f)
+            continue
+
+        open_std, open_acc = result
+        usable = open_std if exclude_accessible else (open_std + open_acc)
+
+        if not usable:
+            # Only accessible seats left (or none) — skip per "avoid handicap seats".
+            log.info(
+                "Skipping %s %s: no non-accessible seats (%d accessible only)",
+                f.get("show_date"), f.get("showtime"), len(open_acc),
+            )
+            continue
+
+        preview = ", ".join(usable[:12]) + ("…" if len(usable) > 12 else "")
+        f["available_seats"] = usable
+        f["seat_summary"] = f"{len(usable)} open seat(s): {preview}"
+        if exclude_accessible and open_acc:
+            f["seat_summary"] += f" (excluded {len(open_acc)} accessible)"
+        kept.append(f)
+
+    return kept
 
 
 async def _amc_showtime_page(theatre: dict, movie_name: str, target_date: str) -> list[dict]:

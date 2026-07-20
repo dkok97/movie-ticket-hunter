@@ -39,6 +39,9 @@ log = logging.getLogger("odyssey.main")
 scheduler = AsyncIOScheduler()
 _is_running = False  # guard to prevent concurrent runs
 
+# Max wall-clock for one check cycle before the watchdog aborts it.
+CHECK_TIMEOUT_SECONDS = 150
+
 # Signatures of showtimes we've already alerted on. We only notify when a
 # showtime *newly* has open seats. If a showtime sells out and later opens
 # again, its signature drops out of this set and we re-alert.
@@ -66,7 +69,11 @@ async def scheduled_check():
 
     try:
         log.info("=== Starting scheduled check (run #%d) ===", run_id)
-        findings, sources, details = await checker.run_all_checks()
+        # Watchdog: never let a single cycle hang forever (e.g. a stalled
+        # request), which would otherwise block all future cycles.
+        findings, sources, details = await asyncio.wait_for(
+            checker.run_all_checks(), timeout=CHECK_TIMEOUT_SECONDS
+        )
 
         db.complete_run(run_id, sources, len(findings), details)
 
@@ -181,6 +188,8 @@ class ConfigUpdate(BaseModel):
     purchase_theatre: str | None = None
     num_tickets: int | None = None
     evening_start_hour: int | None = None
+    report_seats: bool | None = None
+    exclude_accessible_seats: bool | None = None
     theatres: list[dict] | None = None
 
 
@@ -254,7 +263,7 @@ async def get_config():
             theatres = []
     conf["theatres"] = theatres
     # Parse booleans
-    for bool_key in ["notifications_enabled"]:
+    for bool_key in ["notifications_enabled", "report_seats", "exclude_accessible_seats"]:
         val = conf.get(bool_key)
         if isinstance(val, str):
             conf[bool_key] = val.lower() in ("true", "1", "yes")
@@ -268,8 +277,9 @@ async def update_config(update: ConfigUpdate):
     # Serialise complex types
     if "theatres" in updates:
         updates["theatres"] = json.dumps(updates["theatres"])
-    if "notifications_enabled" in updates:
-        updates["notifications_enabled"] = str(updates["notifications_enabled"]).lower()
+    for bool_key in ("notifications_enabled", "report_seats", "exclude_accessible_seats"):
+        if bool_key in updates:
+            updates[bool_key] = str(updates[bool_key]).lower()
 
     cfg.update_config(updates)
 
