@@ -268,7 +268,9 @@ def _parse_amc_movie_page(
             continue
 
         href = link.get("href", "")  # e.g. "/showtimes/140692343"
-        link_text = link.get_text(strip=True)  # e.g. "8:00pm"
+        raw_text = link.get_text(" ", strip=True)  # e.g. "2:00pm UP TO 15% OFF Almost Full"
+        link_text = _clean_showtime(raw_text)       # -> "2:00pm"
+        status = _status_from_text(raw_text)         # -> "Almost Full"
 
         # Build the direct seat-selection URL
         seat_url = f"https://www.amctheatres.com{href}/seats"
@@ -280,6 +282,7 @@ def _parse_amc_movie_page(
                 "theatre_name": theatre_name,
                 "movie_name": movie_name,
                 "showtime": link_text,
+                "status": status,
                 "show_date": target_date,
                 "ticket_url": seat_url,
                 # This page is the format-specific IMAX 70mm event page, so
@@ -537,6 +540,7 @@ def _parse_amc_api_response(
             "theatre_name": theatre.get("name", "AMC Theatre"),
             "movie_name": st_movie,
             "showtime": nice_time,
+            "status": "Almost Full" if st.get("isAlmostSoldOut") is True else "",
             "show_date": target_date,
             "ticket_url": purchase_url,
             "format": movie_format,
@@ -733,9 +737,14 @@ async def _enrich_findings_with_seats(findings: list[dict], seat_fetcher) -> lis
     if not report_seats:
         return findings
 
+    # Bound seat lookups per cycle — each is a network/browser round-trip, and a
+    # wide date range can produce dozens of open showtimes. Beyond the cap,
+    # findings are kept without a seat list.
+    max_lookups = int(conf.get("max_seat_lookups", 12) or 12)
+
     kept: list[dict] = []
-    for f in findings:
-        result = await seat_fetcher(f.get("showtime_id", ""))
+    for idx, f in enumerate(findings):
+        result = None if idx >= max_lookups else await seat_fetcher(f.get("showtime_id", ""))
         if result is None:
             # Seat detail unavailable — keep the finding, just no seat list.
             f["seat_summary"] = ""
@@ -860,7 +869,9 @@ def _parse_amc_html(
     # contains movie/theatre slugs for context.
     showtime_links = soup.find_all("a", href=re.compile(r"^/showtimes/\d+$"))
     for link in showtime_links:
-        link_text = link.get_text(strip=True)  # e.g. "8:00pm"
+        raw_text = link.get_text(" ", strip=True)
+        link_text = _clean_showtime(raw_text)  # e.g. "8:00pm"
+        status = _status_from_text(raw_text)
         aria = (link.get("aria-describedby", "") or "").lower()
 
         # Check if this showtime belongs to our movie
@@ -898,6 +909,7 @@ def _parse_amc_html(
                 "theatre_name": theatre.get("name", "AMC Theatre"),
                 "movie_name": movie_name,
                 "showtime": link_text,
+                "status": status,
                 "show_date": target_date,
                 "ticket_url": seat_url,
                 "format": movie_format,
@@ -1382,6 +1394,26 @@ def _matches_format(context: str, movie_format: str) -> bool:
     return ok
 
 
+# Extract a clean time token, and separately the availability status, from the
+# text of a showtime button (which may also contain promos like "UP TO 15% OFF").
+SHOWTIME_RE = re.compile(r"\d{1,2}:\d{2}\s*[ap]\.?m\.?", re.IGNORECASE)
+STATUS_RE = re.compile(
+    r"almost full|sold\s*out|few (?:seats|tickets) left|last chance|limited", re.IGNORECASE
+)
+
+
+def _clean_showtime(text: str) -> str:
+    """Return just the time (e.g. '2:00pm') from a noisy button label."""
+    m = SHOWTIME_RE.search(text or "")
+    return m.group(0).replace(" ", "").replace(".", "").lower() if m else (text or "").strip()
+
+
+def _status_from_text(text: str) -> str:
+    """Return a normalised availability status ('Almost Full', ...) if present."""
+    m = STATUS_RE.search(text or "")
+    return m.group(0).title() if m else ""
+
+
 def _is_evening_time(text: str, evening_hour: int = 16) -> bool:
     """Check if a time string represents an evening showtime."""
     text = text.strip().upper()
@@ -1476,13 +1508,22 @@ async def run_all_checks() -> tuple[list[dict], list[str], str]:
         all_findings.extend(theatre_findings)
 
         if theatre_findings:
+            span = f"{dates[0]}→{dates[-1]}" if dates else ""
             details_lines.append(
-                f"✅ {theatre_name}: {len(theatre_findings)} open showtime(s) found"
+                f"✅ {theatre_name}: {len(theatre_findings)} open showtime(s) "
+                f"across {len(dates)} date(s) {span}".strip()
             )
-            for f in theatre_findings:
+            # Show only a short preview; full list is in /api/findings.
+            preview = 5
+            for f in theatre_findings[:preview]:
+                status = f.get("status", "")
+                status_str = f" ({status})" if status else ""
                 details_lines.append(
-                    f"   • {f.get('show_date', '')} {f.get('showtime', 'N/A')} — "
-                    f"{f.get('ticket_url', 'N/A')}"
+                    f"   • {f.get('show_date', '')} {f.get('showtime', 'N/A')}{status_str}"
+                )
+            if len(theatre_findings) > preview:
+                details_lines.append(
+                    f"   … +{len(theatre_findings) - preview} more (see /api/findings)"
                 )
         else:
             details_lines.append(
