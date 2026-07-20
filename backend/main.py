@@ -40,8 +40,9 @@ scheduler = AsyncIOScheduler()
 _is_running = False  # guard to prevent concurrent runs
 
 # Max wall-clock for one check cycle before the watchdog aborts it.
-# Generous because the browser fallback renders many dated pages per cycle.
-CHECK_TIMEOUT_SECONDS = 600
+# Generous because verifying seats renders one browser page per show, bounded
+# by the global browser concurrency cap.
+CHECK_TIMEOUT_SECONDS = 900
 
 # Signatures of showtimes we've already alerted on. We only notify when a
 # showtime *newly* has open seats. If a showtime sells out and later opens

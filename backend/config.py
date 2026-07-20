@@ -56,10 +56,10 @@ DEFAULT_CONFIG: dict = {
     "use_browser": True,
     # How many dates to check concurrently per cycle.
     "max_concurrency": 4,
-    # Cap seat-map lookups per cycle (each is a network/browser round-trip).
-    # Shows beyond the cap are reported "(seats unverified)". Raise this (or
-    # narrow the date range) to fully verify every candidate show.
-    "max_seat_lookups": 20,
+    # Max seat-map lookups per date (each is a browser round-trip). High enough
+    # to verify every showtime of a day; overall browser load is bounded by the
+    # global browser concurrency cap (BROWSER_CONCURRENCY env, default 4).
+    "max_seat_lookups": 100,
     "theatres": json.dumps([
         {
             "name": "AMC Lincoln Square 13",

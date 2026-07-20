@@ -27,6 +27,12 @@ _playwright = None
 _browser = None
 _lock = asyncio.Lock()
 
+# Global cap on concurrent browser contexts. Seat verification can request one
+# page per show, and the date sweep is itself concurrent, so without a global
+# limit we could spawn many Chromium contexts at once and exhaust memory.
+_MAX_CONCURRENT = int(os.environ.get("BROWSER_CONCURRENCY", "4") or "4")
+_page_sem = asyncio.Semaphore(_MAX_CONCURRENT)
+
 
 async def _get_browser():
     """Return a live shared browser, launching it on first use."""
@@ -85,6 +91,7 @@ async def fetch_rendered(
 
     context = None
     try:
+      async with _page_sem:
         context = await browser.new_context(
             user_agent=BROWSER_UA,
             viewport={"width": 1280, "height": 2000},
@@ -145,6 +152,7 @@ async def fetch_json_payloads(
     context = None
     matched = []  # response objects to read after the page settles
     try:
+      async with _page_sem:
         context = await browser.new_context(
             user_agent=BROWSER_UA,
             viewport={"width": 1280, "height": 2000},
