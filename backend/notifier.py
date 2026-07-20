@@ -130,7 +130,9 @@ async def _send_purchase_alert(
         show_date = f.get("show_date", "")
         url = f.get("ticket_url", best_url)
         when = _format_when(show_date, showtime)
-        lines.append(f"Showtime {i}: {when}")
+        status = f.get("status", "")
+        status_str = f" — {status}" if status else ""
+        lines.append(f"Showtime {i}: {when}{status_str}")
         seat_summary = f.get("seat_summary", "")
         if seat_summary:
             lines.append(f"  Seats: {seat_summary}")
@@ -182,8 +184,9 @@ async def _send_general_alert(
     for f in findings:
         lines.append(f"  {f.get('theatre_name', 'Unknown Theatre')}")
         when = _format_when(f.get("show_date", ""), f.get("showtime", ""))
+        status = f.get("status", "")
         if when:
-            lines.append(f"    {when}")
+            lines.append(f"    {when}{f'  —  {status}' if status else ''}")
         if f.get("seat_summary"):
             lines.append(f"    Seats: {f['seat_summary']}")
         if f.get("ticket_url"):

@@ -53,6 +53,8 @@ DEFAULT_CONFIG: dict = {
     "use_browser": True,
     # How many dates to check concurrently per cycle.
     "max_concurrency": 4,
+    # Cap seat-map lookups per cycle (each is a network/browser round-trip).
+    "max_seat_lookups": 12,
     "theatres": json.dumps([
         {
             "name": "AMC Lincoln Square 13",
