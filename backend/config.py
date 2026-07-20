@@ -45,16 +45,21 @@ DEFAULT_CONFIG: dict = {
     # 0 = report every showtime of the day (the 70mm shows include 2-3 a.m.
     # screenings that we do NOT want to filter out).
     "evening_start_hour": 0,
-    # Seat-level detail (requires AMC API access to seat data).
+    # Seat-level detail (requires reading the seat map).
     "report_seats": True,            # include open seat labels in notifications
     "exclude_accessible_seats": True,  # ignore wheelchair/companion seats
+    # Drop shows positively determined to have only accessible seats. A show
+    # whose seat map can't be read is kept and labelled "(seats unverified)".
+    "require_standard_seats": True,
     # Use a headless browser (Playwright) to fetch AMC when the API is
     # unavailable — required to get past AMC's Queue-it waiting room.
     "use_browser": True,
     # How many dates to check concurrently per cycle.
     "max_concurrency": 4,
-    # Cap seat-map lookups per cycle (each is a network/browser round-trip).
-    "max_seat_lookups": 12,
+    # Max seat-map lookups per date (each is a browser round-trip). High enough
+    # to verify every showtime of a day; overall browser load is bounded by the
+    # global browser concurrency cap (BROWSER_CONCURRENCY env, default 4).
+    "max_seat_lookups": 100,
     "theatres": json.dumps([
         {
             "name": "AMC Lincoln Square 13",

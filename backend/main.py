@@ -40,8 +40,9 @@ scheduler = AsyncIOScheduler()
 _is_running = False  # guard to prevent concurrent runs
 
 # Max wall-clock for one check cycle before the watchdog aborts it.
-# Generous because the browser fallback renders many dated pages per cycle.
-CHECK_TIMEOUT_SECONDS = 600
+# Generous because verifying seats renders one browser page per show, bounded
+# by the global browser concurrency cap.
+CHECK_TIMEOUT_SECONDS = 900
 
 # Signatures of showtimes we've already alerted on. We only notify when a
 # showtime *newly* has open seats. If a showtime sells out and later opens
@@ -196,6 +197,7 @@ class ConfigUpdate(BaseModel):
     evening_start_hour: int | None = None
     report_seats: bool | None = None
     exclude_accessible_seats: bool | None = None
+    require_standard_seats: bool | None = None
     use_browser: bool | None = None
     theatres: list[dict] | None = None
 
@@ -270,7 +272,7 @@ async def get_config():
             theatres = []
     conf["theatres"] = theatres
     # Parse booleans
-    for bool_key in ["notifications_enabled", "report_seats", "exclude_accessible_seats", "use_browser"]:
+    for bool_key in ["notifications_enabled", "report_seats", "exclude_accessible_seats", "require_standard_seats", "use_browser"]:
         val = conf.get(bool_key)
         if isinstance(val, str):
             conf[bool_key] = val.lower() in ("true", "1", "yes")
@@ -284,7 +286,7 @@ async def update_config(update: ConfigUpdate):
     # Serialise complex types
     if "theatres" in updates:
         updates["theatres"] = json.dumps(updates["theatres"])
-    for bool_key in ("notifications_enabled", "report_seats", "exclude_accessible_seats", "use_browser"):
+    for bool_key in ("notifications_enabled", "report_seats", "exclude_accessible_seats", "require_standard_seats", "use_browser"):
         if bool_key in updates:
             updates[bool_key] = str(updates[bool_key]).lower()
 
