@@ -57,28 +57,37 @@ async def check_amc(theatre: dict, movie_name: str, target_date: str) -> list[di
     api_key = conf.get("amc_api_key", "")
     vendor_id = conf.get("amc_vendor_id", "")
     movie_slug = conf.get("amc_movie_slug", "")
+    use_browser = str(conf.get("use_browser", True)).lower() not in ("false", "0", "no")
 
     # Strategy 0 (preferred): AMC Developer API.
     if api_key:
         api_findings = await _amc_developer_api(theatre, movie_name, target_date, api_key, vendor_id)
         if api_findings is not None:
             return api_findings  # authoritative, even when empty
-        log.warning("AMC API unavailable for %s — falling back to web scraping", target_date)
+        log.warning("AMC API unavailable for %s — falling back to browser/scraping", target_date)
+
+    # Strategy 1 (preferred fallback): headless browser — defeats Queue-it and
+    # the client-side rendering that make plain HTTP scraping useless.
+    if use_browser and movie_slug:
+        findings = await _amc_browser_movie_page(movie_slug, theatre, movie_name, target_date)
+        if findings:
+            findings = await _enrich_findings_with_seats(findings, _browser_fetch_open_seats)
+        return findings
 
     findings: list[dict] = []
 
-    # Strategy 1: Direct AMC movie page (if slug is configured)
+    # Strategy 2: Direct AMC movie page via plain HTTP (unreliable behind Queue-it)
     if movie_slug:
         findings = await _amc_direct_movie_page(movie_slug, theatre, movie_name, target_date)
         if findings:
             return findings
 
-    # Strategy 2: AMC web — showtime page
+    # Strategy 3: AMC web — showtime page
     findings = await _amc_showtime_page(theatre, movie_name, target_date)
     if findings:
         return findings
 
-    # Strategy 3: AMC web — movie search
+    # Strategy 4: AMC web — movie search
     findings = await _amc_movie_search(movie_name, target_date, theatre)
 
     return findings
@@ -118,6 +127,35 @@ async def _amc_direct_movie_page(
             log.error("AMC direct movie page error for %s: %s", url, exc)
 
     return []
+
+
+async def _amc_browser_movie_page(
+    movie_slug: str, theatre: dict, movie_name: str, target_date: str
+) -> list[dict]:
+    """Render the AMC movie page in a headless browser, then parse it.
+
+    Uses the same page structure as the plain-HTTP path, but a real browser
+    passes Queue-it and executes the client-side rendering, so the showtime
+    links actually exist in the returned HTML.
+    """
+    import browser as br
+
+    theatre_slug = theatre.get("slug", "")
+    base = f"https://www.amctheatres.com/movies/{movie_slug}/showtimes"
+    if theatre_slug:
+        url = f"{base}/{theatre_slug}/{target_date}"
+    else:
+        url = f"{base}?date={target_date}"
+
+    html = await br.fetch_rendered(url, wait_selector="a[href^='/showtimes/']", wait_ms=8000)
+    if not html:
+        log.warning("Browser returned no HTML for %s", url)
+        return []
+
+    findings = _parse_amc_movie_page(html, theatre, movie_name, target_date, url)
+    log.info("Browser %s: %d open %s showtime(s)", target_date, len(findings),
+             cfg.get("movie_format", "") or "movie")
+    return findings
 
 
 def _parse_amc_movie_page(
@@ -234,6 +272,7 @@ def _parse_amc_movie_page(
 
         # Build the direct seat-selection URL
         seat_url = f"https://www.amctheatres.com{href}/seats"
+        showtime_id = href.rstrip("/").split("/")[-1]
 
         if _is_evening_time(link_text, evening_hour):
             findings.append({
@@ -247,6 +286,7 @@ def _parse_amc_movie_page(
                 # every showtime on it is already the right format.
                 "format": movie_format,
                 "available": True,
+                "showtime_id": showtime_id,
             })
 
     # --- Strategy C: Check if the page mentions the theatre at all ---
@@ -403,7 +443,10 @@ async def _amc_developer_api(
             )
             # Enrich with seat-level detail (best effort) while the client is open.
             if findings:
-                findings = await _enrich_findings_with_seats(findings, theatre_id, api_key, client)
+                async def _seat_fetcher(sid, _tid=theatre_id, _key=api_key, _client=client):
+                    return await _amc_fetch_open_seats(_tid, sid, _key, _client)
+
+                findings = await _enrich_findings_with_seats(findings, _seat_fetcher)
     except Exception as exc:
         log.error("AMC API error for %s: %s", target_date, exc)
         return None
@@ -550,6 +593,39 @@ def _seat_is_available(seat: dict):
     return None
 
 
+def _extract_largest_embedded_json(html: str):
+    """Extract embedded page-state JSON (e.g. __NEXT_DATA__) from rendered HTML.
+
+    Returns the parsed object, or None. Used to pull the seat layout out of the
+    client-rendered AMC seat-selection page.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Next.js pages expose all page data in <script id="__NEXT_DATA__">.
+    tag = soup.find("script", id="__NEXT_DATA__")
+    if tag and tag.string:
+        try:
+            return json.loads(tag.string)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # Fallbacks: window.__PRELOADED_STATE__ / other JSON script blocks.
+    best = None
+    best_len = 0
+    for pattern in (
+        r'window\.__PRELOADED_STATE__\s*=\s*({.*?})\s*;?\s*</script>',
+        r'window\.__NEXT_DATA__\s*=\s*({.*?})\s*;?\s*</script>',
+    ):
+        for match in re.findall(pattern, html, re.DOTALL):
+            if len(match) > best_len:
+                try:
+                    parsed = json.loads(match)
+                    best, best_len = parsed, len(match)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+    return best
+
+
 def _collect_seats(data) -> list[dict]:
     """Recursively find seat-like dicts in a seat-availability response."""
     seats: list[dict] = []
@@ -569,6 +645,16 @@ def _collect_seats(data) -> list[dict]:
         for item in data:
             seats.extend(_collect_seats(item))
     return seats
+
+
+def _split_open_seats(data) -> tuple[list[str], list[str]]:
+    """From any seat-bearing JSON, return (open_standard, open_accessible) labels."""
+    open_std, open_acc = [], []
+    for s in _collect_seats(data):
+        if _seat_is_available(s) is not True:
+            continue
+        (open_acc if _seat_is_accessible(s) else open_std).append(_seat_label(s))
+    return open_std, open_acc
 
 
 async def _amc_fetch_open_seats(
@@ -610,26 +696,36 @@ async def _amc_fetch_open_seats(
         except Exception:
             return None
 
-        seats = _collect_seats(data)
-        if not seats:
+        if not _collect_seats(data):
             return None
-        open_std, open_acc = [], []
-        for s in seats:
-            if _seat_is_available(s) is not True:
-                continue
-            (open_acc if _seat_is_accessible(s) else open_std).append(_seat_label(s))
-        return open_std, open_acc
+        return _split_open_seats(data)
 
     return None
 
 
-async def _enrich_findings_with_seats(
-    findings: list[dict], theatre_id: str, api_key: str, client: httpx.AsyncClient
-) -> list[dict]:
+async def _browser_fetch_open_seats(showtime_id: str) -> tuple[list[str], list[str]] | None:
+    """Fetch the rendered seat-selection page and extract open seats via a browser."""
+    if not showtime_id:
+        return None
+    import browser as br
+
+    url = f"https://www.amctheatres.com/showtimes/{showtime_id}/seats"
+    html = await br.fetch_rendered(url, wait_selector=None, wait_ms=6000)
+    if not html:
+        return None
+    data = _extract_largest_embedded_json(html)
+    if data is None or not _collect_seats(data):
+        return None
+    return _split_open_seats(data)
+
+
+async def _enrich_findings_with_seats(findings: list[dict], seat_fetcher) -> list[dict]:
     """Attach seat detail to findings and drop shows with no non-accessible seats.
 
-    Controlled by config: report_seats (default on) and exclude_accessible_seats
-    (default on). If seat data can't be retrieved, findings are kept as-is.
+    `seat_fetcher` is an async callable taking a showtime_id and returning
+    (open_standard, open_accessible) or None. Controlled by config: report_seats
+    (default on) and exclude_accessible_seats (default on). If seat data can't be
+    retrieved, findings are kept as-is (no seat list).
     """
     conf = cfg.get_config()
     report_seats = str(conf.get("report_seats", True)).lower() not in ("false", "0", "no")
@@ -639,7 +735,7 @@ async def _enrich_findings_with_seats(
 
     kept: list[dict] = []
     for f in findings:
-        result = await _amc_fetch_open_seats(theatre_id, f.get("showtime_id", ""), api_key, client)
+        result = await seat_fetcher(f.get("showtime_id", ""))
         if result is None:
             # Seat detail unavailable — keep the finding, just no seat list.
             f["seat_summary"] = ""
@@ -1340,33 +1436,40 @@ async def run_all_checks() -> tuple[list[dict], list[str], str]:
     sources_checked: list[str] = []
     details_lines: list[str] = []
 
+    # Bound concurrency so a wide date range doesn't hammer AMC (or spawn too
+    # many browser contexts) all at once, while still finishing a cycle quickly.
+    sem = asyncio.Semaphore(int(conf.get("max_concurrency", 4) or 4))
+
     for theatre in theatres:
         source = theatre.get("source", "amc")
         theatre_name = theatre.get("name", "Unknown")
+
+        async def _check_date(target_date: str):
+            async with sem:
+                try:
+                    if source == "amc":
+                        findings = await check_amc(theatre, movie_name, target_date)
+                    elif source == "fandango":
+                        findings = await check_fandango(theatre, movie_name, target_date)
+                    else:
+                        log.warning("Unknown source: %s", source)
+                        return None
+                    for f in findings:
+                        f.setdefault("show_date", target_date)
+                    return findings
+                except Exception as exc:
+                    log.error("Error checking %s on %s: %s", theatre_name, target_date, exc)
+                    return None  # sentinel for error
+
+        results = await asyncio.gather(*[_check_date(d) for d in dates])
+
         theatre_findings: list[dict] = []
         errored = False
-
-        for target_date in dates:
-            try:
-                if source == "amc":
-                    findings = await check_amc(theatre, movie_name, target_date)
-                elif source == "fandango":
-                    findings = await check_fandango(theatre, movie_name, target_date)
-                else:
-                    log.warning("Unknown source: %s", source)
-                    break
-
-                for f in findings:
-                    # Ensure every finding carries its own date for the range sweep.
-                    f.setdefault("show_date", target_date)
-                theatre_findings.extend(findings)
-
-            except Exception as exc:
-                log.error("Error checking %s on %s: %s", theatre_name, target_date, exc)
+        for r in results:
+            if r is None:
                 errored = True
-
-            # Be polite to AMC across many dates in one cycle.
-            await asyncio.sleep(0.4)
+            else:
+                theatre_findings.extend(r)
 
         suffix = " (partial error)" if errored else ""
         sources_checked.append(f"{source}:{theatre_name}{suffix}")

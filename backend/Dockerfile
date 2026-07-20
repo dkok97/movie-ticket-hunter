@@ -6,6 +6,10 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Install the Chromium browser + OS deps for Playwright (headless fallback that
+# gets past AMC's Queue-it waiting room). This is the heaviest layer.
+RUN playwright install --with-deps chromium
+
 # Copy application code
 COPY . .
 

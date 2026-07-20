@@ -120,8 +120,17 @@ authoritative source — clean JSON, no Queue-it. Auth is a single
 `X-AMC-Vendor-Key` header (set it as `AMC_API_KEY`); `AMC_VENDOR_ID` is no longer
 required. The API path also reads each showtime's `isSoldOut` flag and premium
 `attributes`, and (where the key permits seat-level access) lists the exact open
-seats, excluding accessible/companion seats. If the API errors, the bot falls
-back to web scraping automatically.
+seats, excluding accessible/companion seats.
+
+If the API is unavailable (no key, or the key isn't authorized yet), the bot
+falls back to a **headless browser** (Playwright + Chromium) that renders the
+AMC pages like a real browser — executing the client-side JS and passing the
+Queue-it waiting room — then reuses the same parsers to find open IMAX 70mm
+showtimes and read the seat map. This is enabled by default (`use_browser`) and
+requires Chromium, which the `Dockerfile` installs via `playwright install
+--with-deps chromium`. Set `PLAYWRIGHT_EXECUTABLE_PATH` to use a prebuilt
+Chromium instead. The browser path is slower than the API, so a cycle checks
+dates concurrently (`max_concurrency`, default 4).
 
 ### Default Theatre
 
