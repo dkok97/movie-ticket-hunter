@@ -1,8 +1,32 @@
-# 🎬 Dhurandhar Ticket Hunter
+# 🎬 Odyssey IMAX 70mm Ticket Hunter
 
-A bot + web dashboard that monitors AMC and Fandango for movie ticket availability and sends instant push notifications when tickets drop.
+A bot + web dashboard that watches AMC for **open seats** to Christopher Nolan's
+**The Odyssey (2026)** in the **IMAX 70mm** film format — the format that, in NYC,
+only exists at **AMC Lincoln Square 13**.
 
-Built to catch **Dhurandhar Revenge (2026)** tickets the moment they go on sale — but fully configurable for any movie.
+The 70mm screenings are mostly sold out and run 4–5× per day (including overnight
+2 a.m. shows) for several weeks. This bot re-checks **every 2 minutes**, sweeps the
+**entire date range**, filters out sold-out showtimes, and sends an **instant push
+notification** the moment a showtime has open seats.
+
+> Fully configurable from the UI — point it at a different movie, format, theatre,
+> or date range whenever you like.
+
+---
+
+## How it targets IMAX 70mm
+
+- **AMC Lincoln Square 13** is the only NYC theatre capable of true IMAX 70mm, so it's
+  the single configured theatre (`slug: amc-lincoln-square-13`, `region: new-york-city`).
+- AMC publishes a **format-specific movie page** for the event —
+  `the-odyssey-80679` ("The Odyssey – IMAX 70mm Event"), separate from the standard
+  digital release (`the-odyssey-76238`). The bot watches the 70mm page, so every
+  showtime it sees is already the right format.
+- As a safety net, the `movie_format` setting (`IMAX 70mm`) is also matched against
+  showtime context when scraping generic theatre pages, and **sold-out showtimes are
+  filtered out** so you only get alerted for seats you can actually buy.
+- `evening_start_hour` is set to `0` so the overnight 2 a.m. 70mm screenings are
+  included rather than filtered as "not evening."
 
 ---
 
@@ -10,7 +34,7 @@ Built to catch **Dhurandhar Revenge (2026)** tickets the moment they go on sale 
 
 ### Prerequisites
 
-- Python 3.12+ (managed via pyenv)
+- Python 3.12+
 - Node.js 18+
 
 ### Backend
@@ -49,67 +73,18 @@ The dashboard opens at **http://localhost:5173** (proxies API calls to the backe
 
 ---
 
-## 🚀 Deployment (Railway + Vercel)
-
-### 1. Push to GitHub
-
-Make sure your repo is on GitHub (public or private).
-
-### 2. Deploy Backend on Railway
-
-1. Go to [railway.app](https://railway.app) and sign in
-2. Click **New Project → Deploy from GitHub Repo**
-3. Select your repo
-4. Railway auto-detects the monorepo. Set the **Root Directory** to `backend`
-5. Railway will build using the `Dockerfile` automatically
-
-**Add a Volume** (for persistent SQLite database):
-1. In the Railway service dashboard, click **+ New → Volume**
-2. Set mount path to `/data`
-3. Add an environment variable: `DATA_DIR=/data`
-
-**Environment variables** to set in Railway:
-| Variable | Value |
-|---|---|
-| `DATA_DIR` | `/data` |
-| `NTFY_TOPIC` | `dhurandhar-tickets` (or your custom topic) |
-| `AMC_API_KEY` | _(optional)_ |
-| `AMC_VENDOR_ID` | _(optional)_ |
-
-Railway will give you a public URL like `https://dhurandhar-backend-production-XXXX.up.railway.app`.
-
-### 3. Deploy Frontend on Vercel
-
-1. Go to [vercel.com](https://vercel.com) and sign in
-2. Click **Add New → Project → Import Git Repository**
-3. Select your repo
-4. Set **Root Directory** to `frontend`
-5. Framework Preset: **Vite** (should be auto-detected)
-6. Add this **Environment Variable**:
-
-| Variable | Value |
-|---|---|
-| `VITE_API_URL` | `https://your-railway-url.up.railway.app` |
-
-> ⚠️ **No trailing slash** on the URL. Example: `https://dhurandhar-backend-production-abc123.up.railway.app`
-
-7. Click **Deploy**
-
-### 4. Verify
-
-- Open your Vercel URL — you should see the dashboard
-- The bot is running on Railway, checking every minute
-- Install [ntfy.sh](https://ntfy.sh) and subscribe to your topic to receive notifications
-
----
-
 ## Notifications (ntfy.sh)
 
 Notifications are powered by [ntfy.sh](https://ntfy.sh) — completely free, no signup required.
 
 1. Install the **ntfy** app ([iOS](https://apps.apple.com/app/ntfy/id1625396347) / [Android](https://play.google.com/store/apps/details?id=io.heckel.ntfy))
-2. Subscribe to the topic: **`dhurandhar-tickets`**
-3. Done — you'll get instant push notifications when tickets are found
+2. Subscribe to the topic: **`odyssey-imax-70mm`**
+3. Done — you'll get an instant push notification when open seats are found
+
+When seats open at your priority theatre you'll get a **max-priority** alert with a
+**BUY NOW** button that deep-links straight to the AMC seat-selection page. The bot
+only alerts on **newly** available showtimes (it won't spam you every 2 minutes for
+the same show), and it re-alerts if a sold-out show opens back up.
 
 The topic name is configurable in the Settings tab.
 
@@ -121,23 +96,24 @@ All settings are editable from the **⚙️ Settings** tab in the UI:
 
 | Setting | Default | Description |
 |---|---|---|
-| Movie Name | `Dhurandhar Revenge` | Movie to search for |
-| Movie Year | `2026` | Avoids matching older releases |
-| Target Date | `2026-03-19` | Date to check showtimes for |
-| Poll Interval | `1` minute | How often the bot checks (min: 1) |
-| AMC Movie Slug | `dhurandhar-the-revenge-83029` | Direct AMC movie page identifier |
-| Evening Start Hour | `16` (4 PM) | Only report showtimes after this hour |
-| ntfy Topic | `dhurandhar-tickets` | Push notification channel |
+| Movie Name | `The Odyssey` | Movie to search for |
+| Movie Year | `2026` | Avoids matching older same-name releases |
+| Format | `IMAX 70mm` | Premium-format filter applied to showtimes |
+| Start Date | `2026-07-20` | First date in the sweep (inclusive) |
+| End Date | `2026-08-10` | Last date in the sweep (inclusive, capped at 60 days) |
+| Earliest Show Hour | `0` | `0` = report all shows incl. 2 a.m. screenings |
+| Poll Interval | `2` minutes | How often the bot re-checks (min: 1) |
+| AMC Movie Slug | `the-odyssey-80679` | The IMAX 70mm event page identifier |
+| Priority Theatre | `AMC Lincoln Square 13` | Theatre highlighted with 1-click buy links |
+| Number of Tickets | `2` | Shown in the purchase alert |
+| ntfy Topic | `odyssey-imax-70mm` | Push notification channel |
 | AMC API Key | _(empty)_ | Optional — from [developers.amctheatres.com](https://developers.amctheatres.com) |
 
-### Default Theatres
+### Default Theatre
 
-- AMC Empire 25 (via AMC)
-- AMC Lincoln Square 13 (via AMC)
-- AMC Kips Bay 15 (via AMC)
-- Regal Union Square (via Fandango)
+- **AMC Lincoln Square 13** (via AMC) — the only NYC IMAX 70mm venue.
 
-You can add/remove theatres from the Settings tab.
+You can add/remove theatres from the Settings tab (name, source, url-slug, region, id).
 
 ---
 
@@ -148,7 +124,7 @@ Create a `backend/.env` file to set defaults:
 ```
 AMC_API_KEY=your_key_here
 AMC_VENDOR_ID=your_vendor_id
-NTFY_TOPIC=dhurandhar-tickets
+NTFY_TOPIC=odyssey-imax-70mm
 NTFY_SERVER=https://ntfy.sh
 DATA_DIR=/data
 ```
@@ -159,8 +135,8 @@ DATA_DIR=/data
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `GET` | `/api/health` | Health check (used by Railway) |
-| `GET` | `/api/status` | Bot status, schedule info, last run |
+| `GET` | `/api/health` | Health check |
+| `GET` | `/api/status` | Bot status, schedule, date range, last run |
 | `GET` | `/api/runs` | List of bot run history |
 | `GET` | `/api/findings` | All ticket findings |
 | `GET` | `/api/config` | Current configuration |
@@ -171,29 +147,36 @@ DATA_DIR=/data
 
 ---
 
+## How It Works
+
+Each cycle (every 2 minutes) the bot:
+
+1. **Sweeps the date range** — for every date from Start to End, it fetches the AMC
+   IMAX 70mm event page for AMC Lincoln Square.
+2. **Extracts bookable showtimes** — it collects the live seat-selection links
+   (`/showtimes/{id}/seats`), which correspond to shows that still have seats.
+3. **Filters** — drops anything marked *Sold Out* / unavailable, and (on generic
+   pages) anything that isn't the IMAX 70mm format.
+4. **De-dupes & notifies** — alerts only for showtimes that are *newly* available,
+   via a high-priority ntfy push with a direct booking link.
+
+> **Note:** AMC actively blocks automated scrapers. The bot uses realistic browser
+> headers, but if AMC returns 403s, providing AMC Developer API credentials
+> (`AMC_API_KEY` / `AMC_VENDOR_ID`) gives the most reliable results.
+
 ## Architecture
 
 ```
 ┌──────────────────┐       ┌───────────────────────┐
-│   Vercel (FE)    │──────▶│   Railway (Backend)   │
-│  React + Vite    │  API  │  FastAPI + APScheduler │
-│                  │       │  SQLite (volume)       │
+│   Web dashboard   │──────▶│      Backend          │
+│  React + Vite     │  API  │  FastAPI + APScheduler │
+│                   │       │  SQLite                │
 └──────────────────┘       └───────┬───────────────┘
-                                   │
-                        ┌──────────┼──────────┐
-                        ▼          ▼          ▼
-                    AMC Web    AMC Direct   Fandango
-                    Scraper    Movie Page   Scraper
-                                   │
+                                   │  sweep date range
+                                   ▼
+                        AMC "The Odyssey – IMAX 70mm Event" page
+                          (AMC Lincoln Square 13, all showtimes)
+                                   │  open seats found
                                    ▼
                               ntfy.sh 📱
 ```
-
-## How It Works
-
-The bot uses multiple strategies per source to maximize detection:
-
-**AMC** — Direct movie page (priority) → Developer API (if key provided) → showtime page scraping → search page  
-**Fandango** — autocomplete API → search page scraping → theatre page scraping
-
-Each check cycle iterates over all configured theatres, filters for evening shows, and stores results in a local SQLite database. When tickets are detected, an urgent push notification is sent via ntfy.sh with a direct booking link.

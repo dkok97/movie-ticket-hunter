@@ -4,6 +4,7 @@ Each checker tries multiple strategies (API → embedded JSON → HTML scraping)
 and returns a list of finding dicts.
 """
 
+import asyncio
 import httpx
 import json
 import re
@@ -14,7 +15,15 @@ from urllib.parse import quote_plus
 
 import config as cfg
 
-log = logging.getLogger("dhurandhar.checker")
+log = logging.getLogger("odyssey.checker")
+
+# Markers that indicate a showtime is NOT actually bookable.
+SOLD_OUT_RE = re.compile(
+    r"sold\s*out|no longer available|not available|unavailable|past\b", re.IGNORECASE
+)
+# Premium-format markers.
+FORMAT_70MM_RE = re.compile(r"70\s*-?\s*mm", re.IGNORECASE)
+IMAX_RE = re.compile(r"imax", re.IGNORECASE)
 
 # Common browser-like headers to avoid being blocked
 BROWSER_HEADERS = {
@@ -118,6 +127,7 @@ def _parse_amc_movie_page(
     theatre_slug = theatre.get("slug", "")
     conf = cfg.get_config()
     evening_hour = int(conf.get("evening_start_hour", 16))
+    movie_format = conf.get("movie_format", "")
 
     soup = BeautifulSoup(html, "html.parser")
 
@@ -177,7 +187,7 @@ def _parse_amc_movie_page(
 
     # --- Strategy B: Look for showtime links with href="/showtimes/{id}" ---
     # AMC showtime links look like:
-    #   <a ... href="/showtimes/140692343" aria-describedby="...amc-empire-25...">8:00pm</a>
+    #   <a ... href="/showtimes/140692343" aria-describedby="...amc-lincoln-square-13...">8:00pm</a>
     # The direct seat-selection URL is: /showtimes/{id}/seats
     theatre_lower = theatre_name.lower()
     theatre_slug_normalised = theatre_slug.replace("-", " ") if theatre_slug else ""
@@ -206,6 +216,11 @@ def _parse_amc_movie_page(
         if not theatre_in_aria and not parent_has_theatre:
             continue
 
+        # Skip showtimes that are sold out / not bookable — we only want
+        # showtimes that actually have open seats.
+        if _is_sold_out(link):
+            continue
+
         href = link.get("href", "")  # e.g. "/showtimes/140692343"
         link_text = link.get_text(strip=True)  # e.g. "8:00pm"
 
@@ -220,6 +235,10 @@ def _parse_amc_movie_page(
                 "showtime": link_text,
                 "show_date": target_date,
                 "ticket_url": seat_url,
+                # This page is the format-specific IMAX 70mm event page, so
+                # every showtime on it is already the right format.
+                "format": movie_format,
+                "available": True,
             })
 
     # --- Strategy C: Check if the page mentions the theatre at all ---
@@ -465,6 +484,7 @@ def _parse_amc_html(
     movie_lower = movie_name.lower()
     conf = cfg.get_config()
     evening_hour = int(conf.get("evening_start_hour", 16))
+    movie_format = conf.get("movie_format", "")
 
     # Strategy A: Look for embedded JSON (window.__PRELOADED_STATE__ or similar)
     json_findings = _extract_embedded_json(html, movie_lower, theatre, target_date, evening_hour)
@@ -504,6 +524,14 @@ def _parse_amc_html(
         if not movie_in_aria and not movie_in_parent:
             continue
 
+        # This page lists every movie/format for the theatre, so require the
+        # premium format (IMAX 70mm) to match and skip sold-out showtimes.
+        context = _element_context(link)
+        if not _matches_format(context, movie_format):
+            continue
+        if _is_sold_out(link):
+            continue
+
         href = link.get("href", "")
         seat_url = f"https://www.amctheatres.com{href}/seats"
 
@@ -515,6 +543,8 @@ def _parse_amc_html(
                 "showtime": link_text,
                 "show_date": target_date,
                 "ticket_url": seat_url,
+                "format": movie_format,
+                "available": True,
             })
 
     if findings:
@@ -800,7 +830,7 @@ async def _fandango_movie_search(movie_name: str, target_date: str, theatre: dic
                                 href = link.get("href", "")
                                 m_url = href if href.startswith("http") else f"https://www.fandango.com{href}"
 
-                                # Check if it's the right year (avoid 2025 Dhurandhar)
+                                # Check if it's the right year (avoid an older same-name release)
                                 link_text = link.get_text().lower()
                                 if movie_year and movie_year not in link_text and "2025" in link_text:
                                     continue
@@ -942,6 +972,59 @@ def _parse_fandango_theatre_html(
 # Utilities
 # ===========================================================================
 
+def _element_context(link) -> str:
+    """Collect text/attributes from a link and its nearby ancestors.
+
+    Used to inspect a showtime button for sold-out state and format labels.
+    """
+    parts: list[str] = []
+
+    def _attrs(el):
+        parts.append(el.get_text(" ", strip=True))
+        for attr in ("aria-label", "aria-describedby", "title", "data-status"):
+            val = el.get(attr, "")
+            if val:
+                parts.append(val)
+        cls = el.get("class", "")
+        if isinstance(cls, list):
+            parts.append(" ".join(cls))
+        elif cls:
+            parts.append(cls)
+
+    _attrs(link)
+    # Walk up a couple of levels — AMC wraps each showtime button in a
+    # container that carries the "sold out" state and format label.
+    parent = link.parent
+    depth = 0
+    while parent is not None and depth < 3 and parent.name not in ("body", "html", "main"):
+        _attrs(parent)
+        parent = parent.parent
+        depth += 1
+
+    return " ".join(p for p in parts if p)
+
+
+def _is_sold_out(link) -> bool:
+    """Return True if a showtime element looks sold out / unbookable."""
+    return bool(SOLD_OUT_RE.search(_element_context(link)))
+
+
+def _matches_format(context: str, movie_format: str) -> bool:
+    """Check whether `context` advertises the required premium format.
+
+    Empty movie_format means "any format is fine".
+    """
+    if not movie_format:
+        return True
+    ctx = context or ""
+    ok = True
+    if FORMAT_70MM_RE.search(movie_format):
+        ok = ok and bool(FORMAT_70MM_RE.search(ctx))
+    if IMAX_RE.search(movie_format):
+        ok = ok and bool(IMAX_RE.search(ctx))
+    return ok
+
+
 def _is_evening_time(text: str, evening_hour: int = 16) -> bool:
     """Check if a time string represents an evening showtime."""
     text = text.strip().upper()
@@ -972,14 +1055,25 @@ def _is_evening_time(text: str, evening_hour: int = 16) -> bool:
 # ===========================================================================
 
 async def run_all_checks() -> tuple[list[dict], list[str], str]:
-    """Run checks across all configured theatres and sources.
+    """Run checks across all configured theatres, sources, and dates.
+
+    Sweeps every date in the configured range (start_date..end_date) so we
+    catch open seats at any showtime over the coming weeks.
 
     Returns (findings, sources_checked, details_summary).
     """
     conf = cfg.get_config()
-    movie_name = conf.get("movie_name", "Dhurandhar Revenge")
-    target_date = conf.get("target_date", "2026-03-19")
+    movie_name = conf.get("movie_name", "The Odyssey")
+    movie_format = conf.get("movie_format", "")
+    dates = cfg.get_date_range()
     theatres = cfg.get_theatres()
+
+    label = f"{movie_name}" + (f" ({movie_format})" if movie_format else "")
+    log.info(
+        "Sweeping %d date(s) %s..%s across %d theatre(s) for '%s'",
+        len(dates), dates[0] if dates else "?", dates[-1] if dates else "?",
+        len(theatres), label,
+    )
 
     all_findings: list[dict] = []
     sources_checked: list[str] = []
@@ -988,32 +1082,49 @@ async def run_all_checks() -> tuple[list[dict], list[str], str]:
     for theatre in theatres:
         source = theatre.get("source", "amc")
         theatre_name = theatre.get("name", "Unknown")
-        log.info("Checking %s (%s) for '%s' on %s", theatre_name, source, movie_name, target_date)
+        theatre_findings: list[dict] = []
+        errored = False
 
-        try:
-            if source == "amc":
-                findings = await check_amc(theatre, movie_name, target_date)
-                sources_checked.append(f"amc:{theatre_name}")
-            elif source == "fandango":
-                findings = await check_fandango(theatre, movie_name, target_date)
-                sources_checked.append(f"fandango:{theatre_name}")
-            else:
-                log.warning("Unknown source: %s", source)
-                continue
+        for target_date in dates:
+            try:
+                if source == "amc":
+                    findings = await check_amc(theatre, movie_name, target_date)
+                elif source == "fandango":
+                    findings = await check_fandango(theatre, movie_name, target_date)
+                else:
+                    log.warning("Unknown source: %s", source)
+                    break
 
-            all_findings.extend(findings)
-
-            if findings:
-                details_lines.append(f"✅ {theatre_name}: {len(findings)} result(s) found")
                 for f in findings:
-                    details_lines.append(f"   • {f.get('showtime', 'N/A')} — {f.get('ticket_url', 'N/A')}")
-            else:
-                details_lines.append(f"❌ {theatre_name}: No tickets found")
+                    # Ensure every finding carries its own date for the range sweep.
+                    f.setdefault("show_date", target_date)
+                theatre_findings.extend(findings)
 
-        except Exception as exc:
-            log.error("Error checking %s: %s", theatre_name, exc)
-            details_lines.append(f"⚠️ {theatre_name}: Error — {exc}")
-            sources_checked.append(f"{source}:{theatre_name} (error)")
+            except Exception as exc:
+                log.error("Error checking %s on %s: %s", theatre_name, target_date, exc)
+                errored = True
+
+            # Be polite to AMC across many dates in one cycle.
+            await asyncio.sleep(0.4)
+
+        suffix = " (partial error)" if errored else ""
+        sources_checked.append(f"{source}:{theatre_name}{suffix}")
+        all_findings.extend(theatre_findings)
+
+        if theatre_findings:
+            details_lines.append(
+                f"✅ {theatre_name}: {len(theatre_findings)} open showtime(s) found"
+            )
+            for f in theatre_findings:
+                details_lines.append(
+                    f"   • {f.get('show_date', '')} {f.get('showtime', 'N/A')} — "
+                    f"{f.get('ticket_url', 'N/A')}"
+                )
+        else:
+            details_lines.append(
+                f"❌ {theatre_name}: No open {movie_format or ''} seats across "
+                f"{len(dates)} date(s)".replace("  ", " ")
+            )
 
     details = "\n".join(details_lines)
     return all_findings, sources_checked, details

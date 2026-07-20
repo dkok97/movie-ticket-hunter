@@ -2,12 +2,13 @@
 
 How to subscribe:
   1. Install the ntfy app (iOS / Android) or visit https://ntfy.sh in a browser
-  2. Subscribe to the topic configured below (default: "dhurandhar-tickets")
-  3. That's it — you'll get instant push notifications when tickets drop!
+  2. Subscribe to the topic configured below (default: "odyssey-imax-70mm")
+  3. That's it — you'll get instant push notifications when open seats drop!
 
 Purchase mode:
-  When tickets are found at the configured purchase_theatre (default: AMC Empire 25),
-  the notification includes a 1-click deep link to buy tickets directly on AMC.
+  When open seats are found at the configured purchase_theatre (default:
+  AMC Lincoln Square 13), the notification includes a 1-click deep link to
+  buy tickets directly on AMC.
 """
 
 import httpx
@@ -15,7 +16,7 @@ import logging
 
 import config as cfg
 
-log = logging.getLogger("dhurandhar.notifier")
+log = logging.getLogger("odyssey.notifier")
 
 
 def _build_amc_purchase_url(finding: dict) -> str:
@@ -29,7 +30,8 @@ def _build_amc_purchase_url(finding: dict) -> str:
     """
     conf = cfg.get_config()
     movie_slug = conf.get("amc_movie_slug", "")
-    target_date = conf.get("target_date", "")
+    # Prefer the finding's own date (we sweep a range of dates).
+    target_date = finding.get("show_date", "") or conf.get("target_date", "")
     ticket_url = finding.get("ticket_url", "")
 
     # If we already have a direct purchase/seat-selection link, use it
@@ -38,7 +40,7 @@ def _build_amc_purchase_url(finding: dict) -> str:
 
     # Build theatre-specific movie page URL
     theatres = cfg.get_theatres()
-    purchase_theatre = conf.get("purchase_theatre", "AMC Empire 25")
+    purchase_theatre = conf.get("purchase_theatre", "AMC Lincoln Square 13")
     theatre_slug = ""
     for t in theatres:
         if t.get("name", "").lower() == purchase_theatre.lower():
@@ -65,11 +67,12 @@ async def send_ticket_alert(findings: list[dict]):
         log.info("Notifications disabled, skipping alert.")
         return
 
-    topic = conf.get("ntfy_topic", "dhurandhar-tickets")
+    topic = conf.get("ntfy_topic", "odyssey-imax-70mm")
     server = conf.get("ntfy_server", "https://ntfy.sh")
-    movie = conf.get("movie_name", "Unknown Movie")
-    target_date = conf.get("target_date", "")
-    purchase_theatre = conf.get("purchase_theatre", "AMC Empire 25")
+    movie_name = conf.get("movie_name", "Unknown Movie")
+    movie_format = conf.get("movie_format", "")
+    movie = f"{movie_name} ({movie_format})" if movie_format else movie_name
+    purchase_theatre = conf.get("purchase_theatre", "AMC Lincoln Square 13")
     num_tickets = int(conf.get("num_tickets", 2))
 
     # Split findings into purchase-theatre vs others
@@ -84,7 +87,7 @@ async def send_ticket_alert(findings: list[dict]):
     # --- Send purchase-theatre alert (high priority with buy links) ---
     if purchase_findings:
         await _send_purchase_alert(
-            server, topic, movie, target_date,
+            server, topic, movie,
             purchase_theatre, num_tickets, purchase_findings,
         )
 
@@ -94,7 +97,7 @@ async def send_ticket_alert(findings: list[dict]):
 
 
 async def _send_purchase_alert(
-    server: str, topic: str, movie: str, target_date: str,
+    server: str, topic: str, movie: str,
     purchase_theatre: str, num_tickets: int, findings: list[dict],
 ):
     """Send a purchase-ready notification for the priority theatre."""
@@ -102,21 +105,22 @@ async def _send_purchase_alert(
 
     # Build message body
     lines = [
-        f"TICKETS ARE LIVE at {purchase_theatre}!",
+        f"OPEN SEATS at {purchase_theatre}!",
         f"Movie: {movie}",
-        f"Date: {target_date}",
         f"Tickets needed: {num_tickets}",
         "",
     ]
 
     for i, f in enumerate(findings, 1):
         showtime = f.get("showtime", "Unknown time")
+        show_date = f.get("show_date", "")
         url = f.get("ticket_url", best_url)
-        lines.append(f"Showtime {i}: {showtime}")
+        when = f"{show_date} {showtime}".strip()
+        lines.append(f"Showtime {i}: {when}")
         lines.append(f"  Link: {url}")
         lines.append("")
 
-    lines.append("TAP 'BUY NOW' TO PURCHASE IMMEDIATELY")
+    lines.append("TAP 'BUY NOW' TO GRAB SEATS IMMEDIATELY")
 
     message = "\n".join(lines)
 
@@ -198,7 +202,7 @@ async def send_status_update(message: str, priority: str = "default"):
     if not conf.get("notifications_enabled") or conf.get("notifications_enabled") == "false":
         return
 
-    topic = conf.get("ntfy_topic", "dhurandhar-tickets")
+    topic = conf.get("ntfy_topic", "odyssey-imax-70mm")
     server = conf.get("ntfy_server", "https://ntfy.sh")
 
     try:
@@ -207,7 +211,7 @@ async def send_status_update(message: str, priority: str = "default"):
                 f"{server}/{topic}",
                 content=message.encode("utf-8"),
                 headers={
-                    "Title": "Dhurandhar Ticket Hunter",
+                    "Title": "Odyssey IMAX 70mm Ticket Hunter",
                     "Priority": priority,
                     "Tags": "mag",
                 },

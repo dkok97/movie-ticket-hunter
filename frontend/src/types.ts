@@ -6,7 +6,11 @@ export interface BotStatus {
   last_run: BotRun | null;
   movie_name: string;
   movie_year: string;
+  movie_format: string;
   target_date: string;
+  start_date: string;
+  end_date: string;
+  dates_tracked: number;
   total_findings: number;
   total_runs: number;
 }
@@ -38,13 +42,17 @@ export interface Theatre {
   name: string;
   source: string;
   slug: string;
+  region?: string;
   theatre_id: string;
 }
 
 export interface BotConfig {
   movie_name: string;
   movie_year: string;
+  movie_format: string;
   target_date: string;
+  start_date: string;
+  end_date: string;
   poll_interval_minutes: number;
   ntfy_topic: string;
   ntfy_server: string;
