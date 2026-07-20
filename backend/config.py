@@ -45,6 +45,9 @@ DEFAULT_CONFIG: dict = {
     # 0 = report every showtime of the day (the 70mm shows include 2-3 a.m.
     # screenings that we do NOT want to filter out).
     "evening_start_hour": 0,
+    # Seat-level detail (requires AMC API access to seat data).
+    "report_seats": True,            # include open seat labels in notifications
+    "exclude_accessible_seats": True,  # ignore wheelchair/companion seats
     "theatres": json.dumps([
         {
             "name": "AMC Lincoln Square 13",

@@ -13,10 +13,24 @@ Purchase mode:
 
 import httpx
 import logging
+from datetime import date
 
 import config as cfg
 
 log = logging.getLogger("odyssey.notifier")
+
+
+def _format_when(show_date: str, showtime: str) -> str:
+    """Human-friendly 'Mon Aug 03, 2026 · 2:00 AM' from ISO date + time text."""
+    nice_date = show_date
+    try:
+        nice_date = date.fromisoformat(show_date).strftime("%a %b %d, %Y")
+    except (ValueError, TypeError):
+        pass
+    showtime = (showtime or "").strip()
+    if nice_date and showtime:
+        return f"{nice_date} · {showtime}"
+    return nice_date or showtime
 
 
 def _build_amc_purchase_url(finding: dict) -> str:
@@ -115,8 +129,11 @@ async def _send_purchase_alert(
         showtime = f.get("showtime", "Unknown time")
         show_date = f.get("show_date", "")
         url = f.get("ticket_url", best_url)
-        when = f"{show_date} {showtime}".strip()
+        when = _format_when(show_date, showtime)
         lines.append(f"Showtime {i}: {when}")
+        seat_summary = f.get("seat_summary", "")
+        if seat_summary:
+            lines.append(f"  Seats: {seat_summary}")
         lines.append(f"  Link: {url}")
         lines.append("")
 
@@ -160,12 +177,15 @@ async def _send_general_alert(
     server: str, topic: str, movie: str, findings: list[dict],
 ):
     """Send a standard notification for non-purchase theatres."""
-    lines = [f"Tickets found for {movie}!\n"]
+    lines = [f"Open seats found for {movie}!\n"]
     ticket_url = ""
     for f in findings:
         lines.append(f"  {f.get('theatre_name', 'Unknown Theatre')}")
-        if f.get("showtime"):
-            lines.append(f"    {f['showtime']}")
+        when = _format_when(f.get("show_date", ""), f.get("showtime", ""))
+        if when:
+            lines.append(f"    {when}")
+        if f.get("seat_summary"):
+            lines.append(f"    Seats: {f['seat_summary']}")
         if f.get("ticket_url"):
             lines.append(f"    {f['ticket_url']}")
             if not ticket_url:

@@ -107,7 +107,21 @@ All settings are editable from the **⚙️ Settings** tab in the UI:
 | Priority Theatre | `AMC Lincoln Square 13` | Theatre highlighted with 1-click buy links |
 | Number of Tickets | `2` | Shown in the purchase alert |
 | ntfy Topic | `odyssey-imax-70mm` | Push notification channel |
-| AMC API Key | _(empty)_ | Optional — from [developers.amctheatres.com](https://developers.amctheatres.com) |
+| AMC API Key | _(empty)_ | Your `X-AMC-Vendor-Key` from [developers.amctheatres.com](https://developers.amctheatres.com). **Strongly recommended** — see below |
+| Report Seats | `true` | Include open seat labels in notifications (needs API seat access) |
+| Exclude Accessible Seats | `true` | Ignore wheelchair/companion seats when reporting/alerting |
+
+### Data source: API vs scraping
+
+The public AMC website sits behind a **Queue-it anti-bot waiting room**, so raw
+HTTP scraping is unreliable (it returns the queue/challenge page, not showtimes).
+When `AMC_API_KEY` is set, the bot uses the **AMC Developer API** as the
+authoritative source — clean JSON, no Queue-it. Auth is a single
+`X-AMC-Vendor-Key` header (set it as `AMC_API_KEY`); `AMC_VENDOR_ID` is no longer
+required. The API path also reads each showtime's `isSoldOut` flag and premium
+`attributes`, and (where the key permits seat-level access) lists the exact open
+seats, excluding accessible/companion seats. If the API errors, the bot falls
+back to web scraping automatically.
 
 ### Default Theatre
 
@@ -122,8 +136,7 @@ You can add/remove theatres from the Settings tab (name, source, url-slug, regio
 Create a `backend/.env` file to set defaults:
 
 ```
-AMC_API_KEY=your_key_here
-AMC_VENDOR_ID=your_vendor_id
+AMC_API_KEY=your_x_amc_vendor_key   # from developers.amctheatres.com
 NTFY_TOPIC=odyssey-imax-70mm
 NTFY_SERVER=https://ntfy.sh
 DATA_DIR=/data
@@ -160,9 +173,11 @@ Each cycle (every 2 minutes) the bot:
 4. **De-dupes & notifies** — alerts only for showtimes that are *newly* available,
    via a high-priority ntfy push with a direct booking link.
 
-> **Note:** AMC actively blocks automated scrapers. The bot uses realistic browser
-> headers, but if AMC returns 403s, providing AMC Developer API credentials
-> (`AMC_API_KEY` / `AMC_VENDOR_ID`) gives the most reliable results.
+With an `AMC_API_KEY` set, steps 1–3 are served by the AMC Developer API (one
+JSON call per date, honoring `isSoldOut`/`attributes`), and step 2 additionally
+fetches the seat map to list open, non-accessible seats. Without a key, the bot
+falls back to scraping the (Queue-it-protected) website, which is far less
+reliable — so the API key is strongly recommended.
 
 ## Architecture
 
