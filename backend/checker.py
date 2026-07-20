@@ -76,6 +76,10 @@ async def check_amc(theatre: dict, movie_name: str, target_date: str) -> list[di
     if movie_slug:
         findings = await _amc_direct_movie_page(movie_slug, theatre, movie_name, target_date)
         if findings:
+            # The showtimes page can't tell real seats from held wheelchair
+            # spaces, so verify seats (via browser) to drop ADA-only shows.
+            if use_browser:
+                findings = await _enrich_findings_with_seats(findings, _browser_fetch_open_seats)
             return findings
 
     # Strategy 2: headless browser fallback (defeats Queue-it / client rendering).
@@ -708,46 +712,65 @@ async def _amc_fetch_open_seats(
 
 
 async def _browser_fetch_open_seats(showtime_id: str) -> tuple[list[str], list[str]] | None:
-    """Fetch the rendered seat-selection page and extract open seats via a browser."""
+    """Fetch the seat map via a browser and extract open seats.
+
+    AMC loads the seat map from a separate API call after render, so we capture
+    that network response (rather than the initial HTML). Returns
+    (open_standard, open_accessible) or None if seat data couldn't be read.
+    """
     if not showtime_id:
         return None
     import browser as br
 
     url = f"https://www.amctheatres.com/showtimes/{showtime_id}/seats"
-    html = await br.fetch_rendered(url, wait_selector=None, wait_ms=6000)
-    if not html:
-        return None
-    data = _extract_largest_embedded_json(html)
-    if data is None or not _collect_seats(data):
-        return None
-    return _split_open_seats(data)
+    # Capture any JSON response that looks seat-related.
+    payloads = await br.fetch_json_payloads(url, url_contains=("seat", "layout", "auditorium"))
+    for data in payloads:
+        if _collect_seats(data):
+            return _split_open_seats(data)
+    return None
 
 
 async def _enrich_findings_with_seats(findings: list[dict], seat_fetcher) -> list[dict]:
-    """Attach seat detail to findings and drop shows with no non-accessible seats.
+    """Attach seat detail to findings and (optionally) drop ADA-only shows.
 
     `seat_fetcher` is an async callable taking a showtime_id and returning
-    (open_standard, open_accessible) or None. Controlled by config: report_seats
-    (default on) and exclude_accessible_seats (default on). If seat data can't be
-    retrieved, findings are kept as-is (no seat list).
+    (open_standard, open_accessible) or None (seat data couldn't be read).
+
+    Config:
+      report_seats (default on)          — look up seats at all
+      exclude_accessible_seats (default on) — don't count wheelchair/companion seats
+      require_standard_seats (default on)   — DROP a show that is *positively*
+          determined to have only accessible seats. A show whose seat data can't
+          be read is NOT dropped — it's kept and labelled "(seats unverified)" so
+          a broken/blocked seat lookup can never silently zero out results.
+      max_seat_lookups (default 12)      — cap seat lookups per cycle (each is a
+          network/browser round-trip); beyond the cap, shows are left unverified.
     """
     conf = cfg.get_config()
     report_seats = str(conf.get("report_seats", True)).lower() not in ("false", "0", "no")
     exclude_accessible = str(conf.get("exclude_accessible_seats", True)).lower() not in ("false", "0", "no")
+    require_standard = str(conf.get("require_standard_seats", True)).lower() not in ("false", "0", "no")
     if not report_seats:
         return findings
 
-    # Bound seat lookups per cycle — each is a network/browser round-trip, and a
-    # wide date range can produce dozens of open showtimes. Beyond the cap,
-    # findings are kept without a seat list.
     max_lookups = int(conf.get("max_seat_lookups", 12) or 12)
+    sem = asyncio.Semaphore(int(conf.get("max_concurrency", 4) or 4))
+
+    async def _lookup(idx, f):
+        if idx >= max_lookups:
+            return None  # over budget → unverified
+        async with sem:
+            return await seat_fetcher(f.get("showtime_id", ""))
+
+    results = await asyncio.gather(*[_lookup(i, f) for i, f in enumerate(findings)])
 
     kept: list[dict] = []
-    for idx, f in enumerate(findings):
-        result = None if idx >= max_lookups else await seat_fetcher(f.get("showtime_id", ""))
+    dropped_ada = 0
+    for f, result in zip(findings, results):
         if result is None:
-            # Seat detail unavailable — keep the finding, just no seat list.
-            f["seat_summary"] = ""
+            # Couldn't read seats — keep but clearly mark as unverified.
+            f["seat_summary"] = "(seats unverified)"
             kept.append(f)
             continue
 
@@ -755,11 +778,12 @@ async def _enrich_findings_with_seats(findings: list[dict], seat_fetcher) -> lis
         usable = open_std if exclude_accessible else (open_std + open_acc)
 
         if not usable:
-            # Only accessible seats left (or none) — skip per "avoid handicap seats".
-            log.info(
-                "Skipping %s %s: no non-accessible seats (%d accessible only)",
-                f.get("show_date"), f.get("showtime"), len(open_acc),
-            )
+            # Positively determined: only accessible seats (or none) remain.
+            if require_standard:
+                dropped_ada += 1
+                continue
+            f["seat_summary"] = f"only accessible seats ({len(open_acc)})"
+            kept.append(f)
             continue
 
         preview = ", ".join(usable[:12]) + ("…" if len(usable) > 12 else "")
@@ -768,6 +792,9 @@ async def _enrich_findings_with_seats(findings: list[dict], seat_fetcher) -> lis
         if exclude_accessible and open_acc:
             f["seat_summary"] += f" (excluded {len(open_acc)} accessible)"
         kept.append(f)
+
+    if dropped_ada:
+        log.info("Dropped %d show(s) with only accessible seats", dropped_ada)
 
     return kept
 

@@ -123,6 +123,73 @@ async def fetch_rendered(
                 pass
 
 
+async def fetch_json_payloads(
+    url: str,
+    url_contains: tuple[str, ...] = ("seat",),
+    wait_ms: int = 7000,
+    timeout_ms: int = 45000,
+) -> list:
+    """Navigate to `url` and return JSON bodies of XHR/fetch responses whose URL
+    contains any of `url_contains`.
+
+    AMC renders the seat map client-side and loads seat availability via a
+    separate API call, so the data isn't in the initial HTML — we capture the
+    response as the page loads.
+    """
+    try:
+        browser = await _get_browser()
+    except Exception as exc:
+        log.error("Chromium unavailable (%s) — is Playwright installed?", exc)
+        return []
+
+    context = None
+    matched = []  # response objects to read after the page settles
+    try:
+        context = await browser.new_context(
+            user_agent=BROWSER_UA,
+            viewport={"width": 1280, "height": 2000},
+            locale="en-US",
+        )
+        page = await context.new_page()
+
+        def _on_response(resp):
+            try:
+                u = resp.url.lower()
+                if any(m in u for m in url_contains):
+                    matched.append(resp)
+            except Exception:
+                pass
+
+        page.on("response", _on_response)
+        await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=timeout_ms)
+        except Exception:
+            pass
+        await page.wait_for_timeout(min(wait_ms, 5000))
+
+        payloads = []
+        for resp in matched:
+            try:
+                ctype = (resp.headers or {}).get("content-type", "")
+                if "json" in ctype.lower():
+                    payloads.append(await resp.json())
+            except Exception:
+                continue
+        log.info("Captured %d JSON payload(s) from %d matching response(s) at %s",
+                 len(payloads), len(matched), url)
+        return payloads
+    except Exception as exc:
+        log.error("Browser JSON capture failed for %s: %s", url, exc)
+        return []
+    finally:
+        if context is not None:
+            try:
+                await context.close()
+            except Exception:
+                pass
+
+
 async def shutdown():
     """Close the shared browser on app shutdown."""
     global _playwright, _browser

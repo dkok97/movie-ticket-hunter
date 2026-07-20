@@ -196,6 +196,7 @@ class ConfigUpdate(BaseModel):
     evening_start_hour: int | None = None
     report_seats: bool | None = None
     exclude_accessible_seats: bool | None = None
+    require_standard_seats: bool | None = None
     use_browser: bool | None = None
     theatres: list[dict] | None = None
 
@@ -270,7 +271,7 @@ async def get_config():
             theatres = []
     conf["theatres"] = theatres
     # Parse booleans
-    for bool_key in ["notifications_enabled", "report_seats", "exclude_accessible_seats", "use_browser"]:
+    for bool_key in ["notifications_enabled", "report_seats", "exclude_accessible_seats", "require_standard_seats", "use_browser"]:
         val = conf.get(bool_key)
         if isinstance(val, str):
             conf[bool_key] = val.lower() in ("true", "1", "yes")
@@ -284,7 +285,7 @@ async def update_config(update: ConfigUpdate):
     # Serialise complex types
     if "theatres" in updates:
         updates["theatres"] = json.dumps(updates["theatres"])
-    for bool_key in ("notifications_enabled", "report_seats", "exclude_accessible_seats", "use_browser"):
+    for bool_key in ("notifications_enabled", "report_seats", "exclude_accessible_seats", "require_standard_seats", "use_browser"):
         if bool_key in updates:
             updates[bool_key] = str(updates[bool_key]).lower()
 
