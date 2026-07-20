@@ -48,6 +48,11 @@ DEFAULT_CONFIG: dict = {
     # Seat-level detail (requires AMC API access to seat data).
     "report_seats": True,            # include open seat labels in notifications
     "exclude_accessible_seats": True,  # ignore wheelchair/companion seats
+    # Use a headless browser (Playwright) to fetch AMC when the API is
+    # unavailable — required to get past AMC's Queue-it waiting room.
+    "use_browser": True,
+    # How many dates to check concurrently per cycle.
+    "max_concurrency": 4,
     "theatres": json.dumps([
         {
             "name": "AMC Lincoln Square 13",
