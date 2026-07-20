@@ -15,6 +15,7 @@ export default function ConfigPanel({ config, onSave, onRefresh }: Props) {
     name: "",
     source: "amc",
     slug: "",
+    region: "",
     theatre_id: "",
   });
 
@@ -44,7 +45,7 @@ export default function ConfigPanel({ config, onSave, onRefresh }: Props) {
     const current = (form.theatres ?? config?.theatres ?? []) as Theatre[];
     const updated = [...current, { ...theatreForm }];
     setForm((prev) => ({ ...prev, theatres: updated }));
-    setTheatreForm({ name: "", source: "amc", slug: "", theatre_id: "" });
+    setTheatreForm({ name: "", source: "amc", slug: "", region: "", theatre_id: "" });
   };
 
   const removeTheatre = (idx: number) => {
@@ -78,7 +79,7 @@ export default function ConfigPanel({ config, onSave, onRefresh }: Props) {
               className="input-field"
               value={form.movie_name ?? ""}
               onChange={(e) => handleChange("movie_name", e.target.value)}
-              placeholder="Dhurandhar Revenge"
+              placeholder="The Odyssey"
             />
           </Field>
           <Field label="Movie Year">
@@ -89,15 +90,31 @@ export default function ConfigPanel({ config, onSave, onRefresh }: Props) {
               placeholder="2026"
             />
           </Field>
-          <Field label="Target Date">
+          <Field label="Format (premium format filter)">
+            <input
+              className="input-field"
+              value={form.movie_format ?? ""}
+              onChange={(e) => handleChange("movie_format", e.target.value)}
+              placeholder="IMAX 70mm"
+            />
+          </Field>
+          <Field label="Start Date">
             <input
               className="input-field"
               type="date"
-              value={form.target_date ?? ""}
-              onChange={(e) => handleChange("target_date", e.target.value)}
+              value={form.start_date ?? ""}
+              onChange={(e) => handleChange("start_date", e.target.value)}
             />
           </Field>
-          <Field label="Evening Start Hour (24h)">
+          <Field label="End Date">
+            <input
+              className="input-field"
+              type="date"
+              value={form.end_date ?? ""}
+              onChange={(e) => handleChange("end_date", e.target.value)}
+            />
+          </Field>
+          <Field label="Earliest Show Hour (0 = all shows)">
             <input
               className="input-field"
               type="number"
@@ -111,6 +128,12 @@ export default function ConfigPanel({ config, onSave, onRefresh }: Props) {
             />
           </Field>
         </div>
+        <p className="text-xs text-slate-500 mt-3">
+          The bot sweeps every date from <strong className="text-slate-400">Start</strong> to{" "}
+          <strong className="text-slate-400">End</strong> each cycle. Set{" "}
+          <strong className="text-slate-400">Earliest Show Hour</strong> to <code>0</code> to include the
+          overnight 2&nbsp;a.m. IMAX 70mm screenings.
+        </p>
       </div>
 
       {/* Purchase Settings */}
@@ -132,7 +155,7 @@ export default function ConfigPanel({ config, onSave, onRefresh }: Props) {
           <Field label="Priority Theatre (for purchase alerts)">
             <select
               className="input-field"
-              value={form.purchase_theatre ?? "AMC Empire 25"}
+              value={form.purchase_theatre ?? "AMC Lincoln Square 13"}
               onChange={(e) => handleChange("purchase_theatre", e.target.value)}
             >
               {theatres.map((t, idx) => (
@@ -202,10 +225,12 @@ export default function ConfigPanel({ config, onSave, onRefresh }: Props) {
               className="input-field font-mono text-xs"
               value={form.amc_movie_slug ?? ""}
               onChange={(e) => handleChange("amc_movie_slug", e.target.value)}
-              placeholder="dhurandhar-the-revenge-83029"
+              placeholder="the-odyssey-80679"
             />
             <p className="text-xs text-slate-500 mt-1">
               From amctheatres.com/movies/<strong className="text-slate-400">{form.amc_movie_slug || "slug"}</strong>
+              {" "}— use the <strong className="text-slate-400">IMAX 70mm Event</strong> page so every
+              showtime is already the right format.
             </p>
           </Field>
         </div>
@@ -241,7 +266,7 @@ export default function ConfigPanel({ config, onSave, onRefresh }: Props) {
             <li>
               Subscribe to the topic:{" "}
               <code className="text-gold-400 bg-cinema-900 px-2 py-0.5 rounded font-mono text-xs">
-                {form.ntfy_topic || "dhurandhar-tickets"}
+                {form.ntfy_topic || "odyssey-imax-70mm"}
               </code>
             </li>
             <li>Done! You'll get push notifications when tickets drop 🎉</li>
@@ -254,7 +279,7 @@ export default function ConfigPanel({ config, onSave, onRefresh }: Props) {
               className="input-field font-mono"
               value={form.ntfy_topic ?? ""}
               onChange={(e) => handleChange("ntfy_topic", e.target.value)}
-              placeholder="dhurandhar-tickets"
+              placeholder="odyssey-imax-70mm"
             />
           </Field>
           <Field label="ntfy Server">
@@ -322,7 +347,7 @@ export default function ConfigPanel({ config, onSave, onRefresh }: Props) {
         {/* Add theatre form */}
         <div className="bg-cinema-800/40 rounded-xl p-4 border border-dashed border-cinema-500/40">
           <p className="text-sm text-slate-400 mb-3 font-medium">Add a theatre</p>
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
             <input
               className="input-field text-sm"
               value={theatreForm.name}
@@ -342,6 +367,12 @@ export default function ConfigPanel({ config, onSave, onRefresh }: Props) {
               value={theatreForm.slug}
               onChange={(e) => setTheatreForm((f) => ({ ...f, slug: e.target.value }))}
               placeholder="url-slug"
+            />
+            <input
+              className="input-field text-sm font-mono"
+              value={theatreForm.region ?? ""}
+              onChange={(e) => setTheatreForm((f) => ({ ...f, region: e.target.value }))}
+              placeholder="region (e.g. new-york-city)"
             />
             <input
               className="input-field text-sm font-mono"

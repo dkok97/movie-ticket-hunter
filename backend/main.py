@@ -1,7 +1,8 @@
-"""Dhurandhar Ticket Hunter — FastAPI backend.
+"""Odyssey IMAX 70mm Ticket Hunter — FastAPI backend.
 
-Periodically checks AMC and Fandango for movie ticket availability
-and sends push notifications via ntfy.sh when tickets drop.
+Periodically checks AMC (and Fandango) for open seats to Christopher Nolan's
+"The Odyssey" in IMAX 70mm at AMC Lincoln Square, sweeping a range of dates,
+and sends push notifications via ntfy.sh the moment seats open up.
 """
 
 import asyncio
@@ -29,7 +30,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(name)-24s  %(levelname)-7s  %(message)s",
 )
-log = logging.getLogger("dhurandhar.main")
+log = logging.getLogger("odyssey.main")
 
 # ---------------------------------------------------------------------------
 # Scheduler
@@ -37,6 +38,20 @@ log = logging.getLogger("dhurandhar.main")
 
 scheduler = AsyncIOScheduler()
 _is_running = False  # guard to prevent concurrent runs
+
+# Signatures of showtimes we've already alerted on. We only notify when a
+# showtime *newly* has open seats. If a showtime sells out and later opens
+# again, its signature drops out of this set and we re-alert.
+_notified_signatures: set[str] = set()
+
+
+def _finding_signature(f: dict) -> str:
+    """Stable key for a showtime: date + time + theatre."""
+    return "|".join([
+        str(f.get("show_date", "")),
+        str(f.get("showtime", "")),
+        str(f.get("theatre_name", "")),
+    ])
 
 
 async def scheduled_check():
@@ -57,10 +72,30 @@ async def scheduled_check():
 
         if findings:
             db.save_findings(run_id, findings)
-            log.info("🎟️  Found %d ticket result(s)! Sending notification...", len(findings))
-            await notifier.send_ticket_alert(findings)
+
+            # Only notify for showtimes we haven't already alerted on.
+            current_sigs = {_finding_signature(f) for f in findings}
+            new_findings = [
+                f for f in findings if _finding_signature(f) not in _notified_signatures
+            ]
+            # Forget showtimes that are no longer available so they re-alert
+            # if seats open up again later.
+            _notified_signatures.intersection_update(current_sigs)
+
+            if new_findings:
+                _notified_signatures.update(_finding_signature(f) for f in new_findings)
+                log.info(
+                    "🎟️  %d open showtime(s), %d new! Sending notification...",
+                    len(findings), len(new_findings),
+                )
+                await notifier.send_ticket_alert(new_findings)
+            else:
+                log.info(
+                    "%d open showtime(s), all previously alerted — no new notification.",
+                    len(findings),
+                )
         else:
-            log.info("No tickets found this cycle.")
+            log.info("No open seats found this cycle.")
 
     except Exception as exc:
         log.exception("Check failed: %s", exc)
@@ -98,7 +133,7 @@ async def lifespan(_app: FastAPI):
     interval = int(cfg.get("poll_interval_minutes", 1))
     _reschedule(interval)
     scheduler.start()
-    log.info("🎬 Dhurandhar Ticket Hunter started!")
+    log.info("🎬 Odyssey IMAX 70mm Ticket Hunter started!")
 
     yield
 
@@ -111,8 +146,8 @@ async def lifespan(_app: FastAPI):
 # ---------------------------------------------------------------------------
 
 app = FastAPI(
-    title="Dhurandhar Ticket Hunter",
-    description="Movie ticket availability bot",
+    title="Odyssey IMAX 70mm Ticket Hunter",
+    description="Watches AMC for open IMAX 70mm seats to The Odyssey",
     lifespan=lifespan,
 )
 
@@ -132,7 +167,10 @@ app.add_middleware(
 class ConfigUpdate(BaseModel):
     movie_name: str | None = None
     movie_year: str | None = None
+    movie_format: str | None = None
     target_date: str | None = None
+    start_date: str | None = None
+    end_date: str | None = None
     poll_interval_minutes: int | None = None
     ntfy_topic: str | None = None
     ntfy_server: str | None = None
@@ -166,6 +204,7 @@ async def status():
     next_run = job.next_run_time.isoformat() if job and job.next_run_time else None
 
     total_findings = len(db.get_findings(limit=1000))
+    date_range = cfg.get_date_range()
 
     return {
         "is_checking": _is_running,
@@ -175,7 +214,11 @@ async def status():
         "last_run": last_run,
         "movie_name": conf.get("movie_name", ""),
         "movie_year": conf.get("movie_year", ""),
+        "movie_format": conf.get("movie_format", ""),
         "target_date": conf.get("target_date", ""),
+        "start_date": conf.get("start_date", ""),
+        "end_date": conf.get("end_date", ""),
+        "dates_tracked": len(date_range),
         "total_findings": total_findings,
         "total_runs": len(db.get_runs(limit=10000)),
     }
@@ -261,7 +304,7 @@ async def clear_history():
 async def test_notification():
     """Send a test notification to verify ntfy.sh is working."""
     await notifier.send_status_update(
-        "🔔 Test notification from Dhurandhar Ticket Hunter!\nIf you see this, notifications are working.",
+        "🔔 Test notification from Odyssey IMAX 70mm Ticket Hunter!\nIf you see this, notifications are working.",
         priority="high",
     )
     return {"status": "sent", "message": "Test notification sent. Check your ntfy app!"}

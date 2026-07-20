@@ -1,4 +1,4 @@
-"""SQLite database layer for the Dhurandhar Ticket Hunter bot."""
+"""SQLite database layer for the Odyssey IMAX 70mm Ticket Hunter bot."""
 
 import os
 import sqlite3
@@ -8,7 +8,7 @@ from pathlib import Path
 
 # Use DATA_DIR env var for Railway volume mount, default to local directory
 _data_dir = Path(os.environ.get("DATA_DIR", str(Path(__file__).parent)))
-DB_PATH = _data_dir / "dhurandhar.db"
+DB_PATH = _data_dir / "odyssey.db"
 
 
 def _conn():

@@ -1,7 +1,8 @@
-"""Configuration management for the Dhurandhar Ticket Hunter."""
+"""Configuration management for the Odyssey IMAX 70mm Ticket Hunter."""
 
 import json
 import os
+from datetime import date, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -10,49 +11,47 @@ load_dotenv(Path(__file__).parent / ".env")
 # ---------------------------------------------------------------------------
 # Default configuration
 # ---------------------------------------------------------------------------
+#
+# Target: Christopher Nolan's "The Odyssey" in the IMAX 70mm film format.
+# In NYC this format only exists at AMC Lincoln Square 13. AMC publishes a
+# format-specific movie page for the event — slug "the-odyssey-80679"
+# ("The Odyssey – IMAX 70mm Event") — which is separate from the standard
+# digital release ("the-odyssey-76238"). We watch the 70mm page so every
+# showtime we see is already the right format.
+#
+# Shows are mostly sold out and run 4-5x/day (including 2 a.m. screenings)
+# for several weeks, so we sweep a date *range* and report only showtimes
+# that actually have open seats.
 
 DEFAULT_CONFIG: dict = {
-    "movie_name": "Dhurandhar Revenge",
+    "movie_name": "The Odyssey",
     "movie_year": "2026",
-    "target_date": "2026-03-19",
+    "movie_format": "IMAX 70mm",  # premium format we care about
+    # Date range to sweep (inclusive). "some weeks" of coverage.
+    "start_date": "2026-07-20",
+    "end_date": "2026-08-10",
+    # target_date kept for backward compatibility / single-date fallback.
+    "target_date": "2026-07-20",
     "poll_interval_minutes": 2,
-    "ntfy_topic": os.getenv("NTFY_TOPIC", "dhurandhar-tickets"),
+    "ntfy_topic": os.getenv("NTFY_TOPIC", "odyssey-imax-70mm"),
     "ntfy_server": os.getenv("NTFY_SERVER", "https://ntfy.sh"),
     "notifications_enabled": True,
     "amc_api_key": os.getenv("AMC_API_KEY", ""),
     "amc_vendor_id": os.getenv("AMC_VENDOR_ID", ""),
-    "amc_movie_slug": "dhurandhar-the-revenge-83029",  # from amctheatres.com/movies/{slug}
-    "purchase_theatre": "AMC Empire 25",  # theatre to highlight with 1-click purchase links
-    "num_tickets": 4,  # number of tickets to buy
-    "evening_start_hour": 16,  # 4 PM and later = evening show
+    # The IMAX 70mm event page — every showtime here is already 70mm.
+    "amc_movie_slug": "the-odyssey-80679",  # from amctheatres.com/movies/{slug}
+    "purchase_theatre": "AMC Lincoln Square 13",  # theatre to highlight with 1-click purchase links
+    "num_tickets": 2,  # number of tickets to buy
+    # 0 = report every showtime of the day (the 70mm shows include 2-3 a.m.
+    # screenings that we do NOT want to filter out).
+    "evening_start_hour": 0,
     "theatres": json.dumps([
-        {
-            "name": "AMC Empire 25",
-            "source": "amc",
-            "slug": "amc-empire-25",
-            "region": "new-york-city",
-            "theatre_id": "1552",
-        },
         {
             "name": "AMC Lincoln Square 13",
             "source": "amc",
             "slug": "amc-lincoln-square-13",
             "region": "new-york-city",
             "theatre_id": "1842",
-        },
-        {
-            "name": "AMC Kips Bay 15",
-            "source": "amc",
-            "slug": "amc-kips-bay-15",
-            "region": "new-york-city",
-            "theatre_id": "2310",
-        },
-        {
-            "name": "Regal Union Square",
-            "source": "fandango",
-            "slug": "regal-union-square-stadium-14-rpx-imax-aayjt",
-            "region": "",
-            "theatre_id": "",
         },
     ]),
 }
@@ -105,3 +104,26 @@ def update_config(updates: dict):
 
 def get_theatres() -> list[dict]:
     return get_typed("theatres", [])
+
+
+def get_date_range() -> list[str]:
+    """Return the inclusive list of ISO dates to check.
+
+    Uses start_date/end_date when present, otherwise falls back to the
+    single target_date. Capped at 60 days to avoid runaway request volume.
+    """
+    conf = get_config()
+    start = conf.get("start_date") or conf.get("target_date") or ""
+    end = conf.get("end_date") or start
+
+    try:
+        s = date.fromisoformat(str(start))
+        e = date.fromisoformat(str(end))
+    except (ValueError, TypeError):
+        return [start] if start else []
+
+    if e < s:
+        e = s
+
+    span = min((e - s).days, 60)
+    return [(s + timedelta(days=i)).isoformat() for i in range(span + 1)]

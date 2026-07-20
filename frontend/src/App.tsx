@@ -129,7 +129,7 @@ export default function App() {
 
       {/* Footer */}
       <footer className="max-w-6xl mx-auto px-4 py-8 text-center text-slate-600 text-xs">
-        Dhurandhar Ticket Hunter &middot; Watching for ticket drops so you don't have to.
+        Odyssey IMAX 70mm Ticket Hunter &middot; Watching AMC Lincoln Square for open seats so you don't have to.
       </footer>
     </div>
   );

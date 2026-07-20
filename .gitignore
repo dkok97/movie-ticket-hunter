@@ -32,3 +32,6 @@ Thumbs.db
 .python-version
 .vercel
 .env.vercel
+
+# TS build info
+*.tsbuildinfo

@@ -118,7 +118,7 @@ export default function Dashboard({ status, triggering, onTrigger, onRefresh }: 
               ntfy topic:{" "}
               <code className="text-gold-500 font-mono bg-cinema-800 px-2 py-0.5 rounded">
                 {/* @ts-expect-error status might have ntfy info */}
-                {status.ntfy_topic ?? "dhurandhar-tickets"}
+                {status.ntfy_topic ?? "odyssey-imax-70mm"}
               </code>
             </p>
             <p className="text-xs text-slate-600 mt-1">

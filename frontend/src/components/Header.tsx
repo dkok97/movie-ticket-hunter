@@ -13,19 +13,24 @@ export default function Header({ status }: Props) {
           <div className="text-3xl">🎬</div>
           <div>
             <h1 className="text-xl font-bold tracking-tight">
-              <span className="text-gold-500">Dhurandhar</span>{" "}
-              <span className="text-slate-200">Ticket Hunter</span>
+              <span className="text-gold-500">Odyssey</span>{" "}
+              <span className="text-slate-200">IMAX 70mm Hunter</span>
             </h1>
             {status && (
               <p className="text-xs text-slate-500 mt-0.5">
                 Tracking: <span className="text-slate-400">{status.movie_name}</span>
-                {status.movie_year && (
-                  <span className="text-slate-500"> ({status.movie_year})</span>
+                {status.movie_format && (
+                  <span className="text-gold-400"> · {status.movie_format}</span>
                 )}
-                {status.target_date && (
+                {status.start_date && status.end_date && (
                   <>
                     {" · "}
-                    <span className="text-slate-400">{status.target_date}</span>
+                    <span className="text-slate-400">
+                      {status.start_date} → {status.end_date}
+                    </span>
+                    {status.dates_tracked > 0 && (
+                      <span className="text-slate-500"> ({status.dates_tracked} days)</span>
+                    )}
                   </>
                 )}
               </p>
