@@ -48,8 +48,10 @@ DEFAULT_CONFIG: dict = {
     # Seat-level detail (requires reading the seat map).
     "report_seats": True,            # include open seat labels in notifications
     "exclude_accessible_seats": True,  # ignore wheelchair/companion seats
-    # Drop shows positively determined to have only accessible seats. A show
-    # whose seat map can't be read is kept and labelled "(seats unverified)".
+    # Only alert when the seat map confirms enough non-accessible open seats.
+    # Unverified / ADA-only / short-handed shows are dropped (fail-closed) —
+    # AMC's showtimes page marks ADA-only shows as "bookable", so trusting it
+    # without a seat map produces a flood of false alerts.
     "require_standard_seats": True,
     # Use a headless browser (Playwright) to fetch AMC when the API is
     # unavailable — required to get past AMC's Queue-it waiting room.

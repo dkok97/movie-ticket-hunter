@@ -184,6 +184,25 @@ async def fetch_json_payloads(
                     payloads.append(await resp.json())
             except Exception:
                 continue
+
+        # AMC sometimes embeds seat layout in the rendered page state instead of
+        # (or in addition to) a matching XHR. Pull __NEXT_DATA__ so callers still
+        # get something when network capture is empty.
+        try:
+            import json as _json
+            import re as _re
+
+            html = await page.content()
+            m = _re.search(
+                r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>',
+                html,
+                _re.DOTALL,
+            )
+            if m:
+                payloads.append(_json.loads(m.group(1)))
+        except Exception:
+            pass
+
         log.info("Captured %d JSON payload(s) from %d matching response(s) at %s",
                  len(payloads), len(matched), url)
         return payloads

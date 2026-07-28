@@ -72,29 +72,45 @@ async def check_amc(theatre: dict, movie_name: str, target_date: str) -> list[di
             return api_findings  # authoritative, even when empty
         log.warning("AMC API unavailable for %s — falling back to web scraping", target_date)
 
+    require_standard = str(conf.get("require_standard_seats", True)).lower() not in ("false", "0", "no")
+
+    async def _verify_or_drop(findings: list[dict]) -> list[dict]:
+        """Seat-verify when possible; fail closed if we can't and seats are required."""
+        if not findings:
+            return findings
+        if use_browser:
+            return await _enrich_findings_with_seats(findings, _browser_fetch_open_seats)
+        if require_standard:
+            log.warning(
+                "Dropping %d unverified finding(s) on %s — use_browser is off",
+                len(findings), target_date,
+            )
+            return []
+        return findings
+
     # Strategy 1: plain-HTTP movie page (fast, and proven to work for this page).
     if movie_slug:
         findings = await _amc_direct_movie_page(movie_slug, theatre, movie_name, target_date)
         if findings:
             # The showtimes page can't tell real seats from held wheelchair
             # spaces, so verify seats (via browser) to drop ADA-only shows.
-            if use_browser:
-                findings = await _enrich_findings_with_seats(findings, _browser_fetch_open_seats)
-            return findings
+            return await _verify_or_drop(findings)
 
     # Strategy 2: headless browser fallback (defeats Queue-it / client rendering).
     if use_browser and movie_slug:
         findings = await _amc_browser_movie_page(movie_slug, theatre, movie_name, target_date)
         if findings:
-            return await _enrich_findings_with_seats(findings, _browser_fetch_open_seats)
+            return await _verify_or_drop(findings)
 
     # Strategy 3: AMC web — showtime page
     findings = await _amc_showtime_page(theatre, movie_name, target_date)
     if findings:
-        return findings
+        return await _verify_or_drop(findings)
 
-    # Strategy 4: AMC web — movie search
-    return await _amc_movie_search(movie_name, target_date, theatre)
+    # Strategy 4: AMC web — movie search (often lacks showtime_id → dropped
+    # when require_standard_seats is on, which is the correct fail-closed outcome).
+    findings = await _amc_movie_search(movie_name, target_date, theatre)
+    return await _verify_or_drop(findings)
 
 
 async def _amc_direct_movie_page(
@@ -448,10 +464,18 @@ async def _amc_developer_api(
             findings = _parse_amc_api_response(
                 {"_embedded": {"showtimes": all_showtimes}}, movie_name, theatre, target_date
             )
-            # Enrich with seat-level detail (best effort) while the client is open.
+            # Enrich with seat-level detail while the client is open. Seat endpoints
+            # are often 401/403 on developer keys — fall back to the browser map.
             if findings:
+                use_browser = str(cfg.get("use_browser", True)).lower() not in ("false", "0", "no")
+
                 async def _seat_fetcher(sid, _tid=theatre_id, _key=api_key, _client=client):
-                    return await _amc_fetch_open_seats(_tid, sid, _key, _client)
+                    result = await _amc_fetch_open_seats(_tid, sid, _key, _client)
+                    if result is not None:
+                        return result
+                    if use_browser:
+                        return await _browser_fetch_open_seats(sid)
+                    return None
 
                 findings = await _enrich_findings_with_seats(findings, _seat_fetcher)
     except Exception as exc:
@@ -723,8 +747,11 @@ async def _browser_fetch_open_seats(showtime_id: str) -> tuple[list[str], list[s
     import browser as br
 
     url = f"https://www.amctheatres.com/showtimes/{showtime_id}/seats"
-    # Capture any JSON response that looks seat-related.
-    payloads = await br.fetch_json_payloads(url, url_contains=("seat", "layout", "auditorium"))
+    # Capture any JSON response that looks seat-related, plus embedded page state.
+    payloads = await br.fetch_json_payloads(
+        url,
+        url_contains=("seat", "layout", "auditorium", "inventory", "availability"),
+    )
     for data in payloads:
         if _collect_seats(data):
             return _split_open_seats(data)
@@ -732,27 +759,35 @@ async def _browser_fetch_open_seats(showtime_id: str) -> tuple[list[str], list[s
 
 
 async def _enrich_findings_with_seats(findings: list[dict], seat_fetcher) -> list[dict]:
-    """Attach seat detail to findings and (optionally) drop ADA-only shows.
+    """Attach seat detail to findings and drop shows without usable seats.
 
     `seat_fetcher` is an async callable taking a showtime_id and returning
     (open_standard, open_accessible) or None (seat data couldn't be read).
 
     Config:
-      report_seats (default on)          — look up seats at all
+      report_seats (default on)          — look up seats / include labels
       exclude_accessible_seats (default on) — don't count wheelchair/companion seats
-      require_standard_seats (default on)   — DROP a show that is *positively*
-          determined to have only accessible seats. A show whose seat data can't
-          be read is NOT dropped — it's kept and labelled "(seats unverified)" so
-          a broken/blocked seat lookup can never silently zero out results.
+      require_standard_seats (default on)   — DROP shows that don't positively have
+          enough non-accessible open seats. This includes ADA-only shows AND
+          shows whose seat map couldn't be read (fail-closed). Prefer missing a
+          real opening over spamming alerts for sold-out ADA-only showtimes.
+      num_tickets                        — minimum open seats required to keep a show
       max_seat_lookups (default 12)      — cap seat lookups per cycle (each is a
-          network/browser round-trip); beyond the cap, shows are left unverified.
+          network/browser round-trip); beyond the cap, shows are left unverified
+          and dropped when require_standard_seats is on.
     """
     conf = cfg.get_config()
     report_seats = str(conf.get("report_seats", True)).lower() not in ("false", "0", "no")
     exclude_accessible = str(conf.get("exclude_accessible_seats", True)).lower() not in ("false", "0", "no")
     require_standard = str(conf.get("require_standard_seats", True)).lower() not in ("false", "0", "no")
-    if not report_seats:
+    # Still verify when require_standard_seats is on, even if labels aren't wanted.
+    if not report_seats and not require_standard:
         return findings
+
+    try:
+        min_seats = max(1, int(conf.get("num_tickets", 1) or 1))
+    except (TypeError, ValueError):
+        min_seats = 1
 
     max_lookups = int(conf.get("max_seat_lookups", 12) or 12)
     sem = asyncio.Semaphore(int(conf.get("max_concurrency", 4) or 4))
@@ -767,9 +802,15 @@ async def _enrich_findings_with_seats(findings: list[dict], seat_fetcher) -> lis
 
     kept: list[dict] = []
     dropped_ada = 0
+    dropped_unverified = 0
+    dropped_short = 0
     for f, result in zip(findings, results):
         if result is None:
-            # Couldn't read seats — keep but clearly mark as unverified.
+            # Couldn't read seats. Fail closed when we require real seats —
+            # otherwise AMC's bookable-but-ADA-only showtimes flood alerts.
+            if require_standard:
+                dropped_unverified += 1
+                continue
             f["seat_summary"] = "(seats unverified)"
             kept.append(f)
             continue
@@ -786,6 +827,10 @@ async def _enrich_findings_with_seats(findings: list[dict], seat_fetcher) -> lis
             kept.append(f)
             continue
 
+        if len(usable) < min_seats:
+            dropped_short += 1
+            continue
+
         preview = ", ".join(usable[:12]) + ("…" if len(usable) > 12 else "")
         f["available_seats"] = usable
         f["seat_summary"] = f"{len(usable)} open seat(s): {preview}"
@@ -795,6 +840,10 @@ async def _enrich_findings_with_seats(findings: list[dict], seat_fetcher) -> lis
 
     if dropped_ada:
         log.info("Dropped %d show(s) with only accessible seats", dropped_ada)
+    if dropped_unverified:
+        log.info("Dropped %d show(s) with unverified seats (fail-closed)", dropped_unverified)
+    if dropped_short:
+        log.info("Dropped %d show(s) with fewer than %d open seat(s)", dropped_short, min_seats)
 
     return kept
 

@@ -92,6 +92,25 @@ async def scheduled_check():
             _notified_signatures.intersection_update(current_sigs)
 
             if new_findings:
+                # Defense in depth: never alert on unverified showtimes when we
+                # require confirmed standard seats (legacy fail-open paths).
+                require_standard = str(
+                    cfg.get("require_standard_seats", True)
+                ).lower() not in ("false", "0", "no")
+                if require_standard:
+                    verified = [
+                        f for f in new_findings
+                        if f.get("available_seats")
+                        and "(seats unverified)" not in str(f.get("seat_summary", ""))
+                    ]
+                    skipped = len(new_findings) - len(verified)
+                    if skipped:
+                        log.warning(
+                            "Skipping notify for %d unverified finding(s)", skipped
+                        )
+                    new_findings = verified
+
+            if new_findings:
                 _notified_signatures.update(_finding_signature(f) for f in new_findings)
                 log.info(
                     "🎟️  %d open showtime(s), %d new! Sending notification...",
@@ -100,7 +119,7 @@ async def scheduled_check():
                 await notifier.send_ticket_alert(new_findings)
             else:
                 log.info(
-                    "%d open showtime(s), all previously alerted — no new notification.",
+                    "%d open showtime(s), all previously alerted or unverified — no new notification.",
                     len(findings),
                 )
         else:
