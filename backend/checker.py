@@ -7,6 +7,7 @@ and returns a list of finding dicts.
 import asyncio
 import httpx
 import json
+import os
 import re
 import logging
 from datetime import datetime
@@ -16,6 +17,32 @@ from urllib.parse import quote_plus
 import config as cfg
 
 log = logging.getLogger("odyssey.checker")
+
+# Global throttle on AMC seat-page requests (plain HTTP or browser),
+# independent of how many dates/theatres a sweep runs concurrently. AMC's
+# site 429s surprisingly easily under bursty load from a single IP — a wide
+# date sweep (each date with its own per-date concurrency) can otherwise fire
+# many nearly-simultaneous seat lookups. A concurrency cap alone doesn't
+# prevent bursts (N requests can still all start at once), so we also space
+# out request *start* times with a minimum interval.
+_SEAT_FETCH_CONCURRENCY = int(os.environ.get("AMC_SEAT_CONCURRENCY", "2") or "2")
+_seat_fetch_sem = asyncio.Semaphore(_SEAT_FETCH_CONCURRENCY)
+_SEAT_FETCH_MIN_INTERVAL = float(os.environ.get("AMC_SEAT_MIN_INTERVAL_SECONDS", "1.5") or "1.5")
+_seat_fetch_pace_lock = asyncio.Lock()
+_last_seat_fetch_started_at = 0.0
+
+
+async def _pace_seat_fetch():
+    """Block until at least `_SEAT_FETCH_MIN_INTERVAL` seconds have passed
+    since the last seat-page request was *started*, globally."""
+    global _last_seat_fetch_started_at
+    async with _seat_fetch_pace_lock:
+        loop = asyncio.get_event_loop()
+        now = loop.time()
+        wait = _last_seat_fetch_started_at + _SEAT_FETCH_MIN_INTERVAL - now
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _last_seat_fetch_started_at = loop.time()
 
 # Markers that indicate a showtime is NOT actually bookable.
 SOLD_OUT_RE = re.compile(
@@ -72,21 +99,13 @@ async def check_amc(theatre: dict, movie_name: str, target_date: str) -> list[di
             return api_findings  # authoritative, even when empty
         log.warning("AMC API unavailable for %s — falling back to web scraping", target_date)
 
-    require_standard = str(conf.get("require_standard_seats", True)).lower() not in ("false", "0", "no")
-
     async def _verify_or_drop(findings: list[dict]) -> list[dict]:
-        """Seat-verify when possible; fail closed if we can't and seats are required."""
+        """Seat-verify (plain HTTP, then browser fallback) or fail closed."""
         if not findings:
             return findings
-        if use_browser:
-            return await _enrich_findings_with_seats(findings, _browser_fetch_open_seats)
-        if require_standard:
-            log.warning(
-                "Dropping %d unverified finding(s) on %s — use_browser is off",
-                len(findings), target_date,
-            )
-            return []
-        return findings
+        return await _enrich_findings_with_seats(
+            findings, lambda sid: _website_fetch_open_seats(sid, use_browser)
+        )
 
     # Strategy 1: plain-HTTP movie page (fast, and proven to work for this page).
     if movie_slug:
@@ -113,38 +132,49 @@ async def check_amc(theatre: dict, movie_name: str, target_date: str) -> list[di
     return await _verify_or_drop(findings)
 
 
+def _amc_movie_showtimes_url(movie_slug: str, target_date: str, theatre_slug: str = "") -> str:
+    """Build the AMC movie showtimes URL for a given theatre/date/format.
+
+    AMC has a single movie page per title (no separate per-format slug) —
+    the premium format is selected via the "premium-offering" query param
+    (e.g. "imax70mm"), and "theatre" must be passed explicitly because a
+    fresh browser/HTTP client has no saved location, so AMC would otherwise
+    respond with a "select a nearby theatre" prompt instead of showtimes.
+    """
+    conf = cfg.get_config()
+    premium_offering = conf.get("amc_premium_offering", "")
+
+    params = [f"date={target_date}"]
+    if theatre_slug:
+        params.append(f"theatre={theatre_slug}")
+    if premium_offering:
+        params.append(f"premium-offering={premium_offering}")
+    return f"https://www.amctheatres.com/movies/{movie_slug}/showtimes?" + "&".join(params)
+
+
 async def _amc_direct_movie_page(
     movie_slug: str, theatre: dict, movie_name: str, target_date: str
 ) -> list[dict]:
     """Check the known AMC movie page directly for showtime availability.
 
-    URL: https://www.amctheatres.com/movies/{slug}/showtimes?date={date}
-    This is the most reliable check — it's the official page for the movie.
+    This is the most reliable check — it's the official page for the movie,
+    and (as of writing) AMC serves it over plain HTTP without Queue-it.
     """
     theatre_slug = theatre.get("slug", "")
-    base_movie_url = f"https://www.amctheatres.com/movies/{movie_slug}/showtimes"
-    movie_url_with_date = f"{base_movie_url}?date={target_date}"
+    url = _amc_movie_showtimes_url(movie_slug, target_date, theatre_slug)
 
-    # Also try the theatre-specific URL pattern
-    urls_to_try = [movie_url_with_date]
-    if theatre_slug:
-        urls_to_try.append(f"{base_movie_url}/{theatre_slug}/{target_date}")
+    log.info("Checking AMC direct movie page: %s", url)
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True) as client:
+            resp = await client.get(url, headers=BROWSER_HEADERS)
+            if resp.status_code != 200:
+                log.warning("AMC direct movie page returned %s for %s", resp.status_code, url)
+                return []
 
-    for url in urls_to_try:
-        log.info("Checking AMC direct movie page: %s", url)
-        try:
-            async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True) as client:
-                resp = await client.get(url, headers=BROWSER_HEADERS)
-                if resp.status_code != 200:
-                    log.warning("AMC direct movie page returned %s for %s", resp.status_code, url)
-                    continue
+            return _parse_amc_movie_page(resp.text, theatre, movie_name, target_date, url)
 
-                findings = _parse_amc_movie_page(resp.text, theatre, movie_name, target_date, movie_url_with_date)
-                if findings:
-                    return findings
-
-        except Exception as exc:
-            log.error("AMC direct movie page error for %s: %s", url, exc)
+    except Exception as exc:
+        log.error("AMC direct movie page error for %s: %s", url, exc)
 
     return []
 
@@ -154,18 +184,15 @@ async def _amc_browser_movie_page(
 ) -> list[dict]:
     """Render the AMC movie page in a headless browser, then parse it.
 
-    Uses the same page structure as the plain-HTTP path, but a real browser
-    passes Queue-it and executes the client-side rendering, so the showtime
-    links actually exist in the returned HTML.
+    Uses the same page structure/URL as the plain-HTTP path — this is only a
+    fallback for when Queue-it is actively challenging plain HTTP requests
+    (e.g. during high-traffic periods), since a real browser executes the JS
+    needed to pass the queue.
     """
     import browser as br
 
     theatre_slug = theatre.get("slug", "")
-    base = f"https://www.amctheatres.com/movies/{movie_slug}/showtimes"
-    if theatre_slug:
-        url = f"{base}/{theatre_slug}/{target_date}"
-    else:
-        url = f"{base}?date={target_date}"
+    url = _amc_movie_showtimes_url(movie_slug, target_date, theatre_slug)
 
     html = await br.fetch_rendered(url, wait_selector="a[href^='/showtimes/']", wait_ms=8000)
     if not html:
@@ -465,7 +492,7 @@ async def _amc_developer_api(
                 {"_embedded": {"showtimes": all_showtimes}}, movie_name, theatre, target_date
             )
             # Enrich with seat-level detail while the client is open. Seat endpoints
-            # are often 401/403 on developer keys — fall back to the browser map.
+            # are often 401/403 on developer keys — fall back to the public website.
             if findings:
                 use_browser = str(cfg.get("use_browser", True)).lower() not in ("false", "0", "no")
 
@@ -473,9 +500,7 @@ async def _amc_developer_api(
                     result = await _amc_fetch_open_seats(_tid, sid, _key, _client)
                     if result is not None:
                         return result
-                    if use_browser:
-                        return await _browser_fetch_open_seats(sid)
-                    return None
+                    return await _website_fetch_open_seats(sid, use_browser)
 
                 findings = await _enrich_findings_with_seats(findings, _seat_fetcher)
     except Exception as exc:
@@ -625,39 +650,6 @@ def _seat_is_available(seat: dict):
     return None
 
 
-def _extract_largest_embedded_json(html: str):
-    """Extract embedded page-state JSON (e.g. __NEXT_DATA__) from rendered HTML.
-
-    Returns the parsed object, or None. Used to pull the seat layout out of the
-    client-rendered AMC seat-selection page.
-    """
-    soup = BeautifulSoup(html, "html.parser")
-
-    # Next.js pages expose all page data in <script id="__NEXT_DATA__">.
-    tag = soup.find("script", id="__NEXT_DATA__")
-    if tag and tag.string:
-        try:
-            return json.loads(tag.string)
-        except (json.JSONDecodeError, TypeError):
-            pass
-
-    # Fallbacks: window.__PRELOADED_STATE__ / other JSON script blocks.
-    best = None
-    best_len = 0
-    for pattern in (
-        r'window\.__PRELOADED_STATE__\s*=\s*({.*?})\s*;?\s*</script>',
-        r'window\.__NEXT_DATA__\s*=\s*({.*?})\s*;?\s*</script>',
-    ):
-        for match in re.findall(pattern, html, re.DOTALL):
-            if len(match) > best_len:
-                try:
-                    parsed = json.loads(match)
-                    best, best_len = parsed, len(match)
-                except (json.JSONDecodeError, TypeError):
-                    continue
-    return best
-
-
 def _collect_seats(data) -> list[dict]:
     """Recursively find seat-like dicts in a seat-availability response."""
     seats: list[dict] = []
@@ -735,26 +727,160 @@ async def _amc_fetch_open_seats(
     return None
 
 
-async def _browser_fetch_open_seats(showtime_id: str) -> tuple[list[str], list[str]] | None:
-    """Fetch the seat map via a browser and extract open seats.
+# AMC's public seat-selection page (amctheatres.com/showtimes/{id}/seats)
+# doesn't load seats via a separate JSON API call — the full seat grid is
+# embedded directly in the page as a React Server Component payload: a
+# JSON-encoded string containing `"seatingLayout":{"columns":N,"rows":N,
+# "seats":[{"available":true,"name":"A6","type":"CanReserve",...}, ...]}`.
+# Each entry has an explicit `available` boolean and a `type` — "NotASeat"
+# for aisles/gaps, "CanReserve" for standard seats, "Wheelchair"/"Companion"
+# for accessible ones. This is far more reliable than screen-scraping visible
+# text/aria-labels (which can false-positive on unrelated page chrome, e.g. a
+# "Notifications (F8)" ARIA live-region whose label happens to look like a
+# seat code).
+_SEATING_LAYOUT_KEY = '\\"seatingLayout\\":'
 
-    AMC loads the seat map from a separate API call after render, so we capture
-    that network response (rather than the initial HTML). Returns
-    (open_standard, open_accessible) or None if seat data couldn't be read.
+
+def _extract_seating_layout_json(html: str) -> dict | None:
+    """Extract and decode the embedded `seatingLayout` object from seat-page HTML.
+
+    The object is nested inside a JSON-stringified blob, so quotes/backslashes
+    are escaped — but braces are not, so we can safely brace-match on the raw
+    text to find the object's exact extent before unescaping and parsing it.
+    """
+    idx = html.find(_SEATING_LAYOUT_KEY)
+    if idx == -1:
+        return None
+    start = idx + len(_SEATING_LAYOUT_KEY)
+    if start >= len(html) or html[start] != "{":
+        return None
+
+    depth = 0
+    end = None
+    for i in range(start, len(html)):
+        c = html[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+    if end is None:
+        return None
+
+    unescaped = html[start:end].replace('\\"', '"').replace("\\\\", "\\")
+    try:
+        return json.loads(unescaped)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _parse_seat_map_html(html: str) -> tuple[list[str], list[str]] | None:
+    """Parse AMC's seat-selection page for open seats via the embedded
+    seat-layout JSON.
+
+    Returns (open_standard_labels, open_accessible_labels), or None if no
+    seat layout could be found at all (e.g. an error page), so the caller can
+    fall back / treat it as unverified.
+    """
+    layout = _extract_seating_layout_json(html)
+    if not layout:
+        return None
+    real_seats = [
+        s for s in (layout.get("seats") or [])
+        if s.get("type") != "NotASeat" and s.get("name")
+    ]
+    if not real_seats:
+        return None
+
+    open_std, open_acc = [], []
+    for s in real_seats:
+        if s.get("available") is not True:
+            continue
+        label = str(s.get("name", "")).strip()
+        if ACCESSIBLE_SEAT_RE.search(str(s.get("type", ""))):
+            open_acc.append(label)
+        else:
+            open_std.append(label)
+    return open_std, open_acc
+
+
+async def _http_fetch_open_seats(showtime_id: str) -> tuple[list[str], list[str]] | None:
+    """Fetch the seat map via plain HTTP and parse it (fast path).
+
+    AMC serves the seat page without Queue-it most of the time; this only
+    falls through to None (triggering the browser fallback) on an actual
+    error or a page that doesn't look like a seat map (e.g. a Queue-it
+    challenge during high-traffic periods). On a 429 with a short
+    Retry-After, waits and retries once in place; a long Retry-After means
+    the block will outlast a useful retry, so we bail immediately and let the
+    caller fall back to the browser instead.
+    """
+    if not showtime_id:
+        return None
+    url = f"https://www.amctheatres.com/showtimes/{showtime_id}/seats"
+    for attempt in range(2):
+        try:
+            async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True) as client:
+                resp = await client.get(url, headers=BROWSER_HEADERS)
+                if resp.status_code == 429:
+                    wait_s = float(resp.headers.get("retry-after", 5) or 5)
+                    if attempt == 0 and wait_s <= 5:
+                        log.warning(
+                            "AMC rate-limited seat fetch for showtime %s (429) — retrying in %.0fs",
+                            showtime_id, wait_s,
+                        )
+                        await asyncio.sleep(wait_s)
+                        continue
+                    log.warning(
+                        "AMC rate-limited seat fetch for showtime %s (429, retry-after=%.0fs) — giving up",
+                        showtime_id, wait_s,
+                    )
+                    return None
+                if resp.status_code != 200:
+                    log.warning("Plain-HTTP seat fetch returned %s for showtime %s", resp.status_code, showtime_id)
+                    return None
+                return _parse_seat_map_html(resp.text)
+        except Exception as exc:
+            log.warning("Plain-HTTP seat fetch error for showtime %s: %s", showtime_id, exc)
+            return None
+    return None
+
+
+async def _browser_fetch_open_seats(showtime_id: str) -> tuple[list[str], list[str]] | None:
+    """Fetch the seat map via a headless browser (Queue-it fallback) and parse it.
+
+    Same HTML parsing as `_http_fetch_open_seats` — this only exists for when
+    Queue-it is actively challenging plain HTTP requests.
     """
     if not showtime_id:
         return None
     import browser as br
 
     url = f"https://www.amctheatres.com/showtimes/{showtime_id}/seats"
-    # Capture any JSON response that looks seat-related, plus embedded page state.
-    payloads = await br.fetch_json_payloads(
-        url,
-        url_contains=("seat", "layout", "auditorium", "inventory", "availability"),
+    html = await br.fetch_rendered(
+        url, wait_selector='input[type="checkbox"][aria-label]', wait_ms=8000
     )
-    for data in payloads:
-        if _collect_seats(data):
-            return _split_open_seats(data)
+    if not html:
+        return None
+    return _parse_seat_map_html(html)
+
+
+async def _website_fetch_open_seats(showtime_id: str, use_browser: bool) -> tuple[list[str], list[str]] | None:
+    """Fetch open seats from AMC's public website: plain HTTP first (fast),
+    falling back to a headless browser only if that fails and it's enabled.
+
+    Bounded by a *global* semaphore (across all concurrent dates/theatres in
+    a sweep) since AMC rate-limits bursts of concurrent requests per IP.
+    """
+    async with _seat_fetch_sem:
+        await _pace_seat_fetch()
+        result = await _http_fetch_open_seats(showtime_id)
+        if result is not None:
+            return result
+        if use_browser:
+            return await _browser_fetch_open_seats(showtime_id)
     return None
 
 
