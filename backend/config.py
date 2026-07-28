@@ -47,9 +47,15 @@ DEFAULT_CONFIG: dict = {
     # to just this format (e.g. "imax70mm"). Empty means no format filter.
     "amc_premium_offering": "imax70mm",
     "purchase_theatre": "AMC Lincoln Square 13",  # theatre to highlight with 1-click purchase links
-    # Also used as the minimum open-seat threshold to alert on — 1 means any
-    # single open seat is worth a notification.
+    # Minimum open-seat threshold to alert on (1 = any single open seat is
+    # worth a notification) — also how many seats auto_hold_seats will try
+    # to reserve when it creates a hold.
     "num_tickets": 1,
+    # Automatically drive AMC's guest checkout (seats -> tickets -> order)
+    # for each newly-found showtime, so the notification links straight to a
+    # real, already-held order instead of just a showtime page. No login, no
+    # payment info — you still complete checkout yourself, just faster.
+    "auto_hold_seats": True,
     # 0 = report every showtime of the day (the 70mm shows include 2-3 a.m.
     # screenings that we do NOT want to filter out).
     "evening_start_hour": 0,

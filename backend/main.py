@@ -116,6 +116,7 @@ async def scheduled_check():
                     "🎟️  %d open showtime(s), %d new! Sending notification...",
                     len(findings), len(new_findings),
                 )
+                await _hold_seats_for_findings(new_findings)
                 await notifier.send_ticket_alert(new_findings)
             else:
                 log.info(
@@ -131,6 +132,52 @@ async def scheduled_check():
     finally:
         db.gc_runs(keep=100)
         _is_running = False
+
+
+async def _hold_seats_for_findings(findings: list[dict]):
+    """Best-effort: for each newly-found showtime, drive AMC's guest checkout
+    far enough to create a real order (holding the seat for several minutes)
+    and attach the order URL to the finding so the notification can link
+    straight to "finish paying" instead of "go find the seat yourself".
+
+    Never raises — a hold is a nice-to-have speed boost, not a requirement,
+    and AMC availability/Cloudflare can make it fail for reasons outside our
+    control. Findings without a hold just fall back to the regular showtime
+    link in the notification.
+    """
+    if str(cfg.get("auto_hold_seats", True)).lower() in ("false", "0", "no"):
+        return
+
+    import purchase
+
+    try:
+        num_seats = max(1, int(cfg.get("num_tickets", 1) or 1))
+    except (TypeError, ValueError):
+        num_seats = 1
+
+    sem = asyncio.Semaphore(2)  # a few real browser checkouts in flight at once, at most
+
+    async def _hold(f: dict):
+        showtime_id = f.get("showtime_id", "")
+        if not showtime_id:
+            return
+        async with sem:
+            try:
+                url = await asyncio.wait_for(
+                    purchase.hold_seat(
+                        showtime_id,
+                        seat_names=f.get("available_seats", []),
+                        num_seats=num_seats,
+                    ),
+                    timeout=75,
+                )
+            except Exception as exc:
+                log.warning("Seat hold errored for showtime %s: %s", showtime_id, exc)
+                return
+            if url:
+                f["order_url"] = url
+
+    await asyncio.gather(*[_hold(f) for f in findings])
 
 
 def _reschedule(minutes: int):
@@ -218,6 +265,7 @@ class ConfigUpdate(BaseModel):
     exclude_accessible_seats: bool | None = None
     require_standard_seats: bool | None = None
     use_browser: bool | None = None
+    auto_hold_seats: bool | None = None
     theatres: list[dict] | None = None
 
 
@@ -291,7 +339,7 @@ async def get_config():
             theatres = []
     conf["theatres"] = theatres
     # Parse booleans
-    for bool_key in ["notifications_enabled", "report_seats", "exclude_accessible_seats", "require_standard_seats", "use_browser"]:
+    for bool_key in ["notifications_enabled", "report_seats", "exclude_accessible_seats", "require_standard_seats", "use_browser", "auto_hold_seats"]:
         val = conf.get(bool_key)
         if isinstance(val, str):
             conf[bool_key] = val.lower() in ("true", "1", "yes")
@@ -305,7 +353,7 @@ async def update_config(update: ConfigUpdate):
     # Serialise complex types
     if "theatres" in updates:
         updates["theatres"] = json.dumps(updates["theatres"])
-    for bool_key in ("notifications_enabled", "report_seats", "exclude_accessible_seats", "require_standard_seats", "use_browser"):
+    for bool_key in ("notifications_enabled", "report_seats", "exclude_accessible_seats", "require_standard_seats", "use_browser", "auto_hold_seats"):
         if bool_key in updates:
             updates[bool_key] = str(updates[bool_key]).lower()
 

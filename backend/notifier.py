@@ -8,7 +8,10 @@ How to subscribe:
 Purchase mode:
   When open seats are found at the configured purchase_theatre (default:
   AMC Lincoln Square 13), the notification includes a 1-click deep link to
-  buy tickets directly on AMC.
+  buy tickets directly on AMC. When auto_hold_seats is on (default), that
+  link points to a real, already-held guest order (see purchase.py) instead
+  of just the showtime page, so you have several minutes to pay before it's
+  gone.
 """
 
 import httpx
@@ -37,16 +40,20 @@ def _build_amc_purchase_url(finding: dict) -> str:
     """Build the best possible AMC deep link for purchasing tickets.
 
     AMC URL hierarchy (most specific → least):
-      1. ticket_url from the finding (if it's a direct order/checkout link)
-      2. /movies/{slug}/showtimes/{theatre-slug}/{date}  (theatre-specific movie page)
-      3. /movies/{slug}/showtimes?date={date}             (generic movie page)
-      4. ticket_url as-is (fallback)
+      1. order_url — a real, already-held guest order (see purchase.py)
+      2. ticket_url from the finding (if it's a direct order/checkout link)
+      3. /movies/{slug}/showtimes/{theatre-slug}/{date}  (theatre-specific movie page)
+      4. /movies/{slug}/showtimes?date={date}             (generic movie page)
+      5. ticket_url as-is (fallback)
     """
     conf = cfg.get_config()
     movie_slug = conf.get("amc_movie_slug", "")
     # Prefer the finding's own date (we sweep a range of dates).
     target_date = finding.get("show_date", "") or conf.get("target_date", "")
     ticket_url = finding.get("ticket_url", "")
+
+    if finding.get("order_url"):
+        return finding["order_url"]
 
     # If we already have a direct purchase/seat-selection link, use it
     if ticket_url and any(kw in ticket_url.lower() for kw in ("/seats", "/order", "/checkout", "ticketing")):
@@ -125,10 +132,12 @@ async def _send_purchase_alert(
         "",
     ]
 
+    any_held = False
     for i, f in enumerate(findings, 1):
         showtime = f.get("showtime", "Unknown time")
         show_date = f.get("show_date", "")
-        url = f.get("ticket_url", best_url)
+        order_url = f.get("order_url", "")
+        url = order_url or f.get("ticket_url", best_url)
         when = _format_when(show_date, showtime)
         status = f.get("status", "")
         status_str = f" — {status}" if status else ""
@@ -136,26 +145,39 @@ async def _send_purchase_alert(
         seat_summary = f.get("seat_summary", "")
         if seat_summary:
             lines.append(f"  Seats: {seat_summary}")
-        lines.append(f"  Link: {url}")
+        if order_url:
+            any_held = True
+            lines.append(f"  HELD — finish paying now: {url}")
+        else:
+            lines.append(f"  Link: {url}")
         lines.append("")
 
-    lines.append("TAP 'BUY NOW' TO GRAB SEATS IMMEDIATELY")
+    if any_held:
+        lines.append("Seat(s) already held as a guest order — pay before the hold expires!")
+    else:
+        lines.append("TAP 'BUY NOW' TO GRAB SEATS IMMEDIATELY")
 
     message = "\n".join(lines)
 
     # ntfy actions: up to 3 action buttons
-    # First action = primary buy link
-    actions = [f"view, BUY NOW - {purchase_theatre}, {best_url}"]
+    # First action = primary buy/hold link
+    primary_label = "FINISH PAYING NOW" if findings[0].get("order_url") else "BUY NOW"
+    actions = [f"view, {primary_label} - {purchase_theatre}, {best_url}"]
 
     # Add individual showtime links if there are multiple
     for i, f in enumerate(findings[:2], 1):
-        url = f.get("ticket_url", best_url)
+        url = f.get("order_url") or f.get("ticket_url", best_url)
         showtime = f.get("showtime", f"Show {i}")
         if url and url != best_url:
             actions.append(f"view, {showtime}, {url}")
 
+    title = (
+        f"SEAT HELD: {movie} at {purchase_theatre}"
+        if any_held
+        else f"BUY TICKETS: {movie} at {purchase_theatre}"
+    )
     headers = {
-        "Title": f"BUY TICKETS: {movie} at {purchase_theatre}",
+        "Title": title,
         "Priority": "max",
         "Tags": "rotating_light,ticket,movie_camera",
         "Click": best_url,
@@ -189,10 +211,12 @@ async def _send_general_alert(
             lines.append(f"    {when}{f'  —  {status}' if status else ''}")
         if f.get("seat_summary"):
             lines.append(f"    Seats: {f['seat_summary']}")
-        if f.get("ticket_url"):
-            lines.append(f"    {f['ticket_url']}")
+        url = f.get("order_url") or f.get("ticket_url")
+        if url:
+            prefix = "HELD — finish paying now: " if f.get("order_url") else ""
+            lines.append(f"    {prefix}{url}")
             if not ticket_url:
-                ticket_url = f["ticket_url"]
+                ticket_url = url
         lines.append("")
 
     message = "\n".join(lines)
