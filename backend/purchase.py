@@ -44,6 +44,7 @@ import os
 import random
 import re
 import string
+import time
 
 import browser as br
 
@@ -202,101 +203,120 @@ async def hold_seat_verbose(
     page = None
     console_errors: list[str] = []
     failed_requests: list[str] = []
+    t0 = time.monotonic()
     try:
-        async with br._page_sem:
-            context_kwargs = dict(
-                user_agent=br.BROWSER_UA,
-                viewport={"width": 1400, "height": 1100},
-                locale="en-US",
+        # Do NOT take browser._page_sem here. That semaphore is shared with
+        # seat-map verification during a sweep; a hold waiting behind 4 verify
+        # contexts can burn the entire window the seats are open. Holds are
+        # already capped by max_holds_per_cycle (default 2), so unbounded
+        # browser fan-out isn't a risk on this path.
+        context_kwargs = dict(
+            user_agent=br.BROWSER_UA,
+            viewport={"width": 1400, "height": 1100},
+            locale="en-US",
+        )
+        if proxy:
+            context_kwargs["proxy"] = proxy
+        try:
+            context = await browser_.new_context(**context_kwargs)
+        except Exception as exc:
+            diag["stage"] = "launch_browser"
+            diag["error"] = f"Failed to open browser context (bad proxy config?): {exc}"
+            log.error("Hold[%s]: %s", showtime_id, diag["error"])
+            return diag
+        page = await context.new_page()
+        if debug_screenshot:
+            # Only wired up for the manual debug endpoint — these listeners add
+            # overhead we don't want on the hot auto-hold path.
+            page.on("pageerror", lambda exc: console_errors.append(f"pageerror: {exc}"))
+            page.on(
+                "console",
+                lambda msg: console_errors.append(f"console.{msg.type}: {msg.text}")
+                if msg.type in ("error", "warning") else None,
             )
-            if proxy:
-                context_kwargs["proxy"] = proxy
-            try:
-                context = await browser_.new_context(**context_kwargs)
-            except Exception as exc:
-                diag["stage"] = "launch_browser"
-                diag["error"] = f"Failed to open browser context (bad proxy config?): {exc}"
-                log.error("Hold[%s]: %s", showtime_id, diag["error"])
-                return diag
-            page = await context.new_page()
-            if debug_screenshot:
-                # Only wired up for the manual debug endpoint — these listeners add
-                # overhead we don't want on the hot auto-hold path.
-                page.on("pageerror", lambda exc: console_errors.append(f"pageerror: {exc}"))
-                page.on(
-                    "console",
-                    lambda msg: console_errors.append(f"console.{msg.type}: {msg.text}")
-                    if msg.type in ("error", "warning") else None,
-                )
-                page.on(
-                    "requestfailed",
-                    lambda req: failed_requests.append(f"{req.method} {req.url} — {req.failure}"),
-                )
+            page.on(
+                "requestfailed",
+                lambda req: failed_requests.append(f"{req.method} {req.url} — {req.failure}"),
+            )
 
-            diag["stage"] = "goto_seats_page"
-            await page.goto(seats_url, wait_until="domcontentloaded", timeout=45000)
-            try:
-                await page.wait_for_load_state("networkidle", timeout=20000)
-            except Exception:
-                pass
-            await page.wait_for_timeout(1500)
-            await _dismiss_cookie_banner(page)
+        diag["stage"] = "goto_seats_page"
+        await page.goto(seats_url, wait_until="domcontentloaded", timeout=45000)
+        # Wait for seat checkboxes, NOT networkidle. AMC's seat page keeps
+        # analytics/ads firing for a long time through a residential proxy —
+        # networkidle alone ate most of the ~27s find→hold lag we measured
+        # in production (2026-07-29, showtime 145272579). Checkboxes appearing
+        # is the actual readiness signal we need.
+        try:
+            await page.wait_for_selector(
+                'input[type="checkbox"][aria-label]',
+                timeout=10000,
+            )
+        except Exception:
+            pass
+        await _dismiss_cookie_banner(page)
+        log.info(
+            "Hold[%s]: seats page ready in %.1fs",
+            showtime_id, time.monotonic() - t0,
+        )
 
-            diag["stage"] = "select_seats"
-            selected = await _select_seats(page, seat_names, num_seats, diag)
-            diag["seats_selected"] = selected
-            if selected == 0:
-                diag["error"] = "no open/selectable seat checkboxes found on the live page"
-                log.warning("Hold[%s]: %s (sold out, or page shape changed)", showtime_id, diag["error"])
-                return await _finish(diag, page, debug_screenshot, console_errors, failed_requests)
+        diag["stage"] = "select_seats"
+        selected = await _select_seats(page, seat_names, num_seats, diag)
+        diag["seats_selected"] = selected
+        if selected == 0:
+            diag["error"] = "no open/selectable seat checkboxes found on the live page"
+            log.warning("Hold[%s]: %s (sold out, or page shape changed)", showtime_id, diag["error"])
+            return await _finish(diag, page, debug_screenshot, console_errors, failed_requests)
 
-            diag["stage"] = "continue_to_tickets"
-            if not await _click_continue(page):
-                diag["error"] = "'Continue' button not found/clickable after selecting seat(s)"
-                diag["button_labels"] = await _dump_button_labels(page)
-                log.warning("Hold[%s]: %s", showtime_id, diag["error"])
-                return await _finish(diag, page, debug_screenshot, console_errors, failed_requests)
+        diag["stage"] = "continue_to_tickets"
+        if not await _click_continue(page):
+            diag["error"] = "'Continue' button not found/clickable after selecting seat(s)"
+            diag["button_labels"] = await _dump_button_labels(page)
+            log.warning("Hold[%s]: %s", showtime_id, diag["error"])
+            return await _finish(diag, page, debug_screenshot, console_errors, failed_requests)
 
-            await page.wait_for_timeout(1500)
+        # No fixed sleep — _add_adult_tickets waits for the control itself.
 
-            diag["stage"] = "add_ticket_type"
-            # Ticket-type page can lag behind navigation (slow proxy / hydration).
-            # Waiting for the control + trying a few aria-label variants only
-            # helps — on a fast page wait_for returns immediately.
-            added = await _add_adult_tickets(page, selected)
-            if added == 0:
-                diag["error"] = "'Add Adult Ticket' button not found/clickable on ticket-type page"
-                diag["button_labels"] = await _dump_button_labels(page)
-                log.warning("Hold[%s]: %s (labels seen: %s)", showtime_id, diag["error"], diag["button_labels"])
-                return await _finish(diag, page, debug_screenshot, console_errors, failed_requests)
+        diag["stage"] = "add_ticket_type"
+        # Ticket-type page can lag behind navigation (slow proxy / hydration).
+        # Waiting for the control + trying a few aria-label variants only
+        # helps — on a fast page wait_for returns immediately.
+        added = await _add_adult_tickets(page, selected)
+        if added == 0:
+            diag["error"] = "'Add Adult Ticket' button not found/clickable on ticket-type page"
+            diag["button_labels"] = await _dump_button_labels(page)
+            log.warning("Hold[%s]: %s (labels seen: %s)", showtime_id, diag["error"], diag["button_labels"])
+            return await _finish(diag, page, debug_screenshot, console_errors, failed_requests)
 
-            diag["stage"] = "continue_to_order"
-            if not await _click_continue(page):
-                diag["error"] = "'Continue' button not found/clickable after choosing ticket type"
-                diag["button_labels"] = await _dump_button_labels(page)
-                log.warning("Hold[%s]: %s", showtime_id, diag["error"])
-                return await _finish(diag, page, debug_screenshot, console_errors, failed_requests)
+        diag["stage"] = "continue_to_order"
+        if not await _click_continue(page):
+            diag["error"] = "'Continue' button not found/clickable after choosing ticket type"
+            diag["button_labels"] = await _dump_button_labels(page)
+            log.warning("Hold[%s]: %s", showtime_id, diag["error"])
+            return await _finish(diag, page, debug_screenshot, console_errors, failed_requests)
 
-            diag["stage"] = "wait_for_order"
-            try:
-                await page.wait_for_url(re.compile(r".*/orders/.*"), timeout=20000)
-            except Exception:
-                pass
-            final_url = page.url
+        diag["stage"] = "wait_for_order"
+        try:
+            await page.wait_for_url(re.compile(r".*/orders/.*"), timeout=20000)
+        except Exception:
+            pass
+        final_url = page.url
 
-            if "/orders/" not in final_url:
-                diag["error"] = "never reached an /orders/ URL after checkout (blocked/redirected?)"
-                log.warning(
-                    "Hold[%s]: %s — landed on %s", showtime_id, diag["error"], final_url,
-                )
-                return await _finish(diag, page, debug_screenshot, console_errors, failed_requests)
+        if "/orders/" not in final_url:
+            diag["error"] = "never reached an /orders/ URL after checkout (blocked/redirected?)"
+            log.warning(
+                "Hold[%s]: %s — landed on %s", showtime_id, diag["error"], final_url,
+            )
+            return await _finish(diag, page, debug_screenshot, console_errors, failed_requests)
 
-            m = _ORDER_URL_RE.match(final_url)
-            order_url = m.group(0) if m else final_url
-            diag["stage"] = "done"
-            diag["order_url"] = order_url
-            log.info("Held %d seat(s) for showtime %s -> %s", selected, showtime_id, order_url)
-            return await _finish(diag, page, debug_screenshot=False)
+        m = _ORDER_URL_RE.match(final_url)
+        order_url = m.group(0) if m else final_url
+        diag["stage"] = "done"
+        diag["order_url"] = order_url
+        log.info(
+            "Held %d seat(s) for showtime %s -> %s (%.1fs)",
+            selected, showtime_id, order_url, time.monotonic() - t0,
+        )
+        return await _finish(diag, page, debug_screenshot=False)
     except Exception as exc:
         diag["error"] = f"{type(exc).__name__}: {exc}"
         log.error("Hold[%s]: failed at stage=%s: %s", showtime_id, diag["stage"], exc)

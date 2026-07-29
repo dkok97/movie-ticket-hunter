@@ -371,6 +371,12 @@ async def lifespan(_app: FastAPI):
     interval = int(cfg.get("poll_interval_minutes", 1))
     _reschedule(interval)
     scheduler.start()
+    # Pre-warm Chromium so the first hold doesn't pay a cold-launch tax.
+    try:
+        import browser
+        await browser._get_browser()
+    except Exception as exc:
+        log.warning("Chromium pre-warm failed (holds will retry on demand): %s", exc)
     log.info("🎬 Odyssey IMAX 70mm Ticket Hunter started!")
 
     yield
