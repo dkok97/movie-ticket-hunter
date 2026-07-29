@@ -38,6 +38,7 @@ either — see `_proxy_config()` for why a *sticky, geo-targeted* session is
 required instead.
 """
 
+import asyncio
 import base64
 import logging
 import os
@@ -81,7 +82,7 @@ def _iproyal_session_id() -> str:
     return "".join(random.choices(alphabet, k=8))
 
 
-def _proxy_config() -> dict | None:
+def _proxy_config(*, session_id: str | None = None) -> dict | None:
     """Playwright `proxy` dict for the hold flow's browser context, from
     HOLD_PROXY_SERVER (e.g. `http://geo.iproyal.com:12321`) plus optional
     HOLD_PROXY_USERNAME / HOLD_PROXY_PASSWORD. None if unset (falls back to
@@ -105,7 +106,11 @@ def _proxy_config() -> dict | None:
     Configurable via HOLD_PROXY_COUNTRY / HOLD_PROXY_STATE / HOLD_PROXY_CITY /
     HOLD_PROXY_STICKY_LIFETIME; only applied when HOLD_PROXY_USERNAME looks
     like an IPRoyal username (set HOLD_PROXY_STICKY=0 to disable entirely for
-    other providers whose password syntax this would break)."""
+    other providers whose password syntax this would break).
+
+    Pass ``session_id`` to reuse an existing sticky session (warm-context
+    pool); otherwise a fresh 8-char id is generated.
+    """
     server = os.environ.get("HOLD_PROXY_SERVER", "").strip()
     if not server:
         return None
@@ -130,13 +135,140 @@ def _proxy_config() -> dict | None:
             parts.append(f"state-{state}")
         if city:
             parts.append(f"city-{city}")
-        parts.append(f"session-{_iproyal_session_id()}")
+        parts.append(f"session-{session_id or _iproyal_session_id()}")
         if lifetime:
             parts.append(f"lifetime-{lifetime}")
         password = "_".join(parts)
     if password:
         cfg["password"] = password
     return cfg
+
+
+# ---------------------------------------------------------------------------
+# Warm hold context — sticky proxy + AMC cookies kept ready between holds
+# ---------------------------------------------------------------------------
+#
+# Production (2026-07-29): cold-starting a proxied context + first seats-page
+# navigation cost ~14s before checkboxes appeared. Seats vanish in seconds, so
+# we keep one BrowserContext alive (same sticky IPRoyal session) and only open
+# a fresh Page per hold. Warming also hits amctheatres.com once so Queue-it /
+# CDN cookies are already set when a seat opens.
+
+_warm_lock = asyncio.Lock()
+_warm_context = None
+_warm_session_id: str | None = None
+_warm_created_at: float = 0.0
+_warm_has_proxy: bool = False
+
+# Refresh before the sticky session expires (default lifetime 15m).
+_WARM_MAX_AGE_SECONDS = float(os.environ.get("HOLD_WARM_MAX_AGE_SECONDS", "600") or "600")
+_WARM_HOME_URL = "https://www.amctheatres.com/movie-theatres/new-york/amc-lincoln-square-13"
+
+
+def _context_kwargs(proxy: dict | None) -> dict:
+    kwargs = dict(
+        user_agent=br.BROWSER_UA,
+        viewport={"width": 1400, "height": 1100},
+        locale="en-US",
+    )
+    if proxy:
+        kwargs["proxy"] = proxy
+    return kwargs
+
+
+async def _close_warm_context_unlocked():
+    global _warm_context, _warm_session_id, _warm_created_at, _warm_has_proxy
+    ctx = _warm_context
+    _warm_context = None
+    _warm_session_id = None
+    _warm_created_at = 0.0
+    _warm_has_proxy = False
+    if ctx is not None:
+        try:
+            await ctx.close()
+        except Exception:
+            pass
+
+
+async def invalidate_warm_hold_context(*, reason: str = ""):
+    """Drop the warm context (e.g. after Cloudflare / hard hold failure)."""
+    async with _warm_lock:
+        if _warm_context is not None:
+            log.info("Invalidating warm hold context%s", f" ({reason})" if reason else "")
+        await _close_warm_context_unlocked()
+
+
+async def ensure_warm_hold_context(*, force: bool = False):
+    """Return a live hold BrowserContext, creating/refreshing if needed.
+
+    Safe to call at app startup and before each hold. When a proxy is
+    configured, uses one sticky session for the life of the warm context.
+    """
+    global _warm_context, _warm_session_id, _warm_created_at, _warm_has_proxy
+
+    async with _warm_lock:
+        age = time.monotonic() - _warm_created_at if _warm_created_at else 9999.0
+        if (
+            not force
+            and _warm_context is not None
+            and age < _WARM_MAX_AGE_SECONDS
+        ):
+            return _warm_context
+
+        await _close_warm_context_unlocked()
+
+        try:
+            browser_ = await br._get_browser()
+        except Exception as exc:
+            log.warning("Warm hold context: Chromium unavailable (%s)", exc)
+            return None
+
+        session_id = _iproyal_session_id()
+        proxy = _proxy_config(session_id=session_id)
+        try:
+            ctx = await browser_.new_context(**_context_kwargs(proxy))
+        except Exception as exc:
+            log.warning("Warm hold context: failed to open context (%s)", exc)
+            return None
+
+        # Prime Queue-it / CDN cookies through the sticky proxy so the first
+        # real seats navigation isn't also the first contact with AMC.
+        page = None
+        try:
+            page = await ctx.new_page()
+            await page.goto(_WARM_HOME_URL, wait_until="domcontentloaded", timeout=45000)
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=5000)
+            except Exception:
+                pass
+            await _dismiss_cookie_banner(page)
+            await page.wait_for_timeout(500)
+        except Exception as exc:
+            log.warning("Warm hold context: priming navigation failed (%s) — keeping context anyway", exc)
+        finally:
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+
+        _warm_context = ctx
+        _warm_session_id = session_id if proxy else None
+        _warm_created_at = time.monotonic()
+        _warm_has_proxy = proxy is not None
+        log.info(
+            "Warm hold context ready (proxy=%s, sticky_session=%s, max_age=%.0fs)",
+            _warm_has_proxy,
+            _warm_session_id or "n/a",
+            _WARM_MAX_AGE_SECONDS,
+        )
+        return _warm_context
+
+
+async def shutdown_warm_hold_context():
+    """Close the warm context on app shutdown."""
+    async with _warm_lock:
+        await _close_warm_context_unlocked()
 
 
 async def hold_seat(
@@ -176,12 +308,15 @@ async def hold_seat_verbose(
     page.screenshot() call) so it defaults off for the normal auto-hold path
     and is only meant for the manual /api/debug/hold-test endpoint.
     """
-    proxy = _proxy_config()
+    # Prefer the warm pool's sticky session so using_proxy reflects reality
+    # even before we open a page.
+    proxy = _proxy_config(session_id=_warm_session_id) if _warm_session_id else _proxy_config()
     diag = {
         "order_url": None, "stage": "start", "error": None,
         "final_url": None, "final_title": None, "seats_selected": 0,
         "screenshot_b64": None, "button_labels": None,
-        "using_proxy": proxy is not None,
+        "using_proxy": proxy is not None or _warm_has_proxy,
+        "warm_context": False,
     }
 
     if not showtime_id:
@@ -191,7 +326,7 @@ async def hold_seat_verbose(
     seat_names = seat_names or []
 
     try:
-        browser_ = await br._get_browser()
+        await br._get_browser()
     except Exception as exc:
         diag["stage"] = "launch_browser"
         diag["error"] = f"Chromium unavailable: {exc}"
@@ -201,6 +336,7 @@ async def hold_seat_verbose(
     seats_url = f"https://www.amctheatres.com/showtimes/{showtime_id}/seats"
     context = None
     page = None
+    owns_context = False  # False when reusing the warm pool — don't close it
     console_errors: list[str] = []
     failed_requests: list[str] = []
     t0 = time.monotonic()
@@ -210,21 +346,32 @@ async def hold_seat_verbose(
         # contexts can burn the entire window the seats are open. Holds are
         # already capped by max_holds_per_cycle (default 2), so unbounded
         # browser fan-out isn't a risk on this path.
-        context_kwargs = dict(
-            user_agent=br.BROWSER_UA,
-            viewport={"width": 1400, "height": 1100},
-            locale="en-US",
-        )
-        if proxy:
-            context_kwargs["proxy"] = proxy
-        try:
-            context = await browser_.new_context(**context_kwargs)
-        except Exception as exc:
-            diag["stage"] = "launch_browser"
-            diag["error"] = f"Failed to open browser context (bad proxy config?): {exc}"
-            log.error("Hold[%s]: %s", showtime_id, diag["error"])
-            return diag
-        page = await context.new_page()
+        context = await ensure_warm_hold_context()
+        if context is not None:
+            try:
+                page = await context.new_page()
+                diag["warm_context"] = True
+                diag["using_proxy"] = _warm_has_proxy
+            except Exception as exc:
+                log.warning("Hold[%s]: warm context new_page failed (%s) — cold fallback", showtime_id, exc)
+                context = None
+                page = None
+
+        if page is None:
+            # Cold path: brand-new context (and sticky session) for this hold.
+            browser_ = await br._get_browser()
+            proxy = _proxy_config()
+            diag["using_proxy"] = proxy is not None
+            try:
+                context = await browser_.new_context(**_context_kwargs(proxy))
+                owns_context = True
+                page = await context.new_page()
+            except Exception as exc:
+                diag["stage"] = "launch_browser"
+                diag["error"] = f"Failed to open browser context (bad proxy config?): {exc}"
+                log.error("Hold[%s]: %s", showtime_id, diag["error"])
+                return diag
+
         if debug_screenshot:
             # Only wired up for the manual debug endpoint — these listeners add
             # overhead we don't want on the hot auto-hold path.
@@ -255,8 +402,8 @@ async def hold_seat_verbose(
             pass
         await _dismiss_cookie_banner(page)
         log.info(
-            "Hold[%s]: seats page ready in %.1fs",
-            showtime_id, time.monotonic() - t0,
+            "Hold[%s]: seats page ready in %.1fs (warm=%s)",
+            showtime_id, time.monotonic() - t0, diag["warm_context"],
         )
 
         diag["stage"] = "select_seats"
@@ -313,8 +460,8 @@ async def hold_seat_verbose(
         diag["stage"] = "done"
         diag["order_url"] = order_url
         log.info(
-            "Held %d seat(s) for showtime %s -> %s (%.1fs)",
-            selected, showtime_id, order_url, time.monotonic() - t0,
+            "Held %d seat(s) for showtime %s -> %s (%.1fs, warm=%s)",
+            selected, showtime_id, order_url, time.monotonic() - t0, diag["warm_context"],
         )
         return await _finish(diag, page, debug_screenshot=False)
     except Exception as exc:
@@ -322,9 +469,39 @@ async def hold_seat_verbose(
         log.error("Hold[%s]: failed at stage=%s: %s", showtime_id, diag["stage"], exc)
         return await _finish(diag, page, debug_screenshot, console_errors, failed_requests)
     finally:
-        if context is not None:
+        # Capture title before closing page — used to decide warm invalidation.
+        final_title = (diag.get("final_title") or "") if diag else ""
+        try:
+            if page is not None and not diag.get("final_title"):
+                final_title = await page.title()
+        except Exception:
+            pass
+        if page is not None:
+            try:
+                await page.close()
+            except Exception:
+                pass
+        if owns_context and context is not None:
             try:
                 await context.close()
+            except Exception:
+                pass
+        # Burn the warm context after Cloudflare / hard blocks so the next
+        # hold gets a fresh sticky IP instead of a poisoned session.
+        title_l = (final_title or "").lower()
+        err_l = (diag.get("error") or "").lower()
+        if (
+            "cloudflare" in title_l
+            or "attention required" in title_l
+            or "you have been blocked" in title_l
+            or "blocked" in err_l
+        ):
+            await invalidate_warm_hold_context(reason=final_title or diag.get("error") or "blocked")
+        elif not owns_context and context is not None:
+            # Keep the sticky proxy/TCP warm, but drop checkout cookies so the
+            # next hold doesn't inherit a half-finished cart.
+            try:
+                await context.clear_cookies()
             except Exception:
                 pass
 
