@@ -114,8 +114,14 @@ def _rank_findings(findings: list[dict]) -> list[dict]:
 async def _on_open_seat(finding: dict, *, run_id: int) -> None:
     """Called the instant a seat map confirms open seats.
 
-    Must return quickly so other showtimes keep verifying. Spawns hold+notify
-    as a background task.
+    Must return quickly so other showtimes keep verifying. Spawns a background
+    task that:
+      1. Notifies immediately with the seat-map link (no waiting on hold)
+      2. Attempts a guest-checkout hold in parallel with you opening the app
+      3. If a hold lands, sends a second "SEAT HELD" ntfy with the order URL
+
+    Confirmed via production (2026-07-29): awaiting the hold *before* ntfy
+    added ~27s of lag — by then F20/F19 on an Odyssey show were already gone.
     """
     global _holds_this_cycle
 
@@ -133,29 +139,44 @@ async def _on_open_seat(finding: dict, *, run_id: int) -> None:
             _holds_this_cycle += 1
 
     log.info(
-        "🎟️  Open seats NOW %s %s @ %s (%s) — %s",
+        "🎟️  Open seats NOW %s %s @ %s (%s) — notify now%s",
         finding.get("show_date"),
         finding.get("showtime"),
         finding.get("theatre_name"),
         finding.get("seat_summary", ""),
-        "holding immediately" if should_hold else "notifying (hold cap reached)",
+        ", hold in background" if should_hold else " (hold cap reached)",
     )
 
-    async def _hold_and_notify():
+    async def _notify_then_hold():
         try:
             db.save_findings(run_id, [finding])
-            if should_hold:
-                await _hold_seats_for_findings([finding])
+            # 1) Alert immediately — seats link. Do not wait on Playwright.
             await notifier.send_ticket_alert([finding])
+            if not should_hold:
+                return
+            # 2) Hold in the background; 3) follow-up ntfy if we got an order.
+            await _hold_seats_for_findings([finding])
+            if finding.get("order_url"):
+                log.info(
+                    "🎟️  Hold succeeded for %s — sending SEAT HELD follow-up",
+                    finding.get("showtime_id"),
+                )
+                await notifier.send_ticket_alert([finding])
         except Exception as exc:
-            log.exception("Immediate hold/notify failed for %s: %s", finding.get("showtime_id"), exc)
+            log.exception(
+                "Immediate notify/hold failed for %s: %s",
+                finding.get("showtime_id"), exc,
+            )
 
-    _immediate_tasks.append(asyncio.create_task(_hold_and_notify()))
+    _immediate_tasks.append(asyncio.create_task(_notify_then_hold()))
 
 
 async def _process_new_findings(findings: list[dict], *, label: str = "") -> int:
     """Notify (and hold if capacity remains) for findings not already handled
     by the immediate on_open_seat path. Returns newly alerted count.
+
+    Same notify-first / hold-second order as ``_on_open_seat`` so leftovers
+    don't inherit the old "wait for hold before ntfy" lag.
     """
     global _holds_this_cycle
 
@@ -197,15 +218,18 @@ async def _process_new_findings(findings: list[dict], *, label: str = "") -> int
 
     _notified_signatures.update(_finding_signature(f) for f in new_findings)
     log.info(
-        "🎟️  %d leftover open showtime(s)%s — holding %d, notifying all...",
+        "🎟️  %d leftover open showtime(s)%s — notify now, holding %d...",
         len(new_findings),
         f" [{label}]" if label else "",
         len(to_hold),
     )
+    await notifier.send_ticket_alert(new_findings)
     if to_hold:
         await _hold_seats_for_findings(to_hold)
         _holds_this_cycle += len(to_hold)
-    await notifier.send_ticket_alert(new_findings)
+        held = [f for f in to_hold if f.get("order_url")]
+        if held:
+            await notifier.send_ticket_alert(held)
     return len(new_findings)
 
 
