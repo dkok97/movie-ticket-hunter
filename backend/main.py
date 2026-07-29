@@ -371,13 +371,14 @@ async def lifespan(_app: FastAPI):
     interval = int(cfg.get("poll_interval_minutes", 1))
     _reschedule(interval)
     scheduler.start()
-    # Pre-warm Chromium + sticky-proxy hold context so the first real seat
-    # open doesn't pay cold-launch + first-contact-with-AMC tax (~14s observed).
+    # Pre-warm Chromium immediately; sticky-proxy hold context in the
+    # background so Railway's healthcheck (often ~10s) isn't blocked by a
+    # slow IPRoyal + AMC priming navigation.
     try:
         import browser
         import purchase
         await browser._get_browser()
-        await purchase.ensure_warm_hold_context()
+        asyncio.create_task(purchase.ensure_warm_hold_context())
     except Exception as exc:
         log.warning("Hold pre-warm failed (holds will retry on demand): %s", exc)
     log.info("🎬 Odyssey IMAX 70mm Ticket Hunter started!")
