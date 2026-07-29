@@ -149,7 +149,30 @@ AMC_API_KEY=your_x_amc_vendor_key   # from developers.amctheatres.com
 NTFY_TOPIC=odyssey-imax-70mm
 NTFY_SERVER=https://ntfy.sh
 DATA_DIR=/data
+
+# Only needed for auto_hold_seats when deployed to a datacenter host (see below)
+HOLD_PROXY_SERVER=http://geo.iproyal.com:12321
+HOLD_PROXY_USERNAME=your_proxy_username
+HOLD_PROXY_PASSWORD=your_proxy_password
 ```
+
+### `auto_hold_seats` requires a residential proxy on cloud hosts
+
+When `auto_hold_seats` is on, the bot drives AMC's guest checkout (seats →
+tickets → order) to actually hold a seat instead of just linking to the
+seat map. Confirmed via production debugging: AMC's CDN returns `403` for
+every JS/CSS asset request when that checkout page is loaded from a
+datacenter IP (Railway, AWS, GCP, etc.) — the page's HTML still loads, but
+with zero interactivity, so the flow can never complete a hold. It works
+fine from a normal residential/home IP.
+
+To make this work on a cloud host, route just the hold flow's browser
+traffic through a residential proxy by setting `HOLD_PROXY_SERVER` (+
+`HOLD_PROXY_USERNAME`/`HOLD_PROXY_PASSWORD` if your provider requires auth).
+Any residential-proxy provider that gives you an `http://host:port` +
+credentials works (e.g. IPRoyal, Bright Data, Smartproxy). Only the hold
+flow uses this proxy — the much higher-volume plain scraping/seat-checking
+path never needs one, since it doesn't require JS to load.
 
 ---
 

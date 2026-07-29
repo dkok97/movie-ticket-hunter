@@ -18,17 +18,25 @@ order is created (e.g. reloading the order page to double check it worked).
 So this module captures the order URL and closes the browser context
 immediately — it never re-visits the order itself.
 
-Note: this flow was only validated by hand from a residential/dev IP.
-Checkout/order-creation endpoints are frequently guarded by stricter
-anti-fraud rules than plain page views (datacenter IP ranges — which is what
-a Railway deployment looks like to AMC — are a classic trigger), so
-production behavior can differ from local testing. `hold_seat_verbose` exists
-to make that failure mode diagnosable from the deployed environment without
-needing full server log access.
+Confirmed via production debugging (2026-07-29): AMC's CDN returns HTTP 403
+for every JS/CSS asset request (`/_next/static/...`) when the browser runs
+from Railway's datacenter IP, even though the top-level seat-map document
+itself loads fine (200, via the Queue-it redirect). Without its JS bundle,
+the page has zero interactivity — that's the real cause of every "click
+didn't work" failure mode seen in this file's history (broken zoom-scale
+seat map, a ~150,000px-tall ticket screen, clicks that report success but
+never change app state). This never reproduced from a residential/dev IP.
+So: the browser context used for the *hold* flow specifically (not the much
+higher-volume plain scraping/seat-checking path, which never needs JS to
+run) is routed through a residential/mobile proxy when one is configured, via
+the HOLD_PROXY_SERVER / HOLD_PROXY_USERNAME / HOLD_PROXY_PASSWORD env vars
+(see README). Without a proxy configured, this still runs — from a
+datacenter host it just won't be able to complete a hold, same as before.
 """
 
 import base64
 import logging
+import os
 import re
 
 import browser as br
@@ -57,6 +65,25 @@ _CLOSE_BANNER_SELECTORS = (
     'button[aria-label*="Close" i]',
     'button:has-text("Close")',
 )
+
+
+def _proxy_config() -> dict | None:
+    """Playwright `proxy` dict for the hold flow's browser context, from
+    HOLD_PROXY_SERVER (e.g. `http://geo.iproyal.com:12321`) plus optional
+    HOLD_PROXY_USERNAME / HOLD_PROXY_PASSWORD. None if unset (falls back to
+    the deployment's own IP, which works fine locally but not from a
+    datacenter host like Railway — see module docstring)."""
+    server = os.environ.get("HOLD_PROXY_SERVER", "").strip()
+    if not server:
+        return None
+    cfg = {"server": server}
+    username = os.environ.get("HOLD_PROXY_USERNAME", "").strip()
+    password = os.environ.get("HOLD_PROXY_PASSWORD", "").strip()
+    if username:
+        cfg["username"] = username
+    if password:
+        cfg["password"] = password
+    return cfg
 
 
 async def hold_seat(
@@ -88,6 +115,7 @@ async def hold_seat_verbose(
         "final_title": str | None, # that page's <title>, if we could read it
         "seats_selected": int,     # how many seat checkboxes we actually clicked
         "screenshot_b64": str | None,  # only set if debug_screenshot=True and it failed
+        "using_proxy": bool,       # whether HOLD_PROXY_SERVER was configured for this run
       }
 
     This never raises — callers that only want the URL should use
@@ -95,10 +123,12 @@ async def hold_seat_verbose(
     page.screenshot() call) so it defaults off for the normal auto-hold path
     and is only meant for the manual /api/debug/hold-test endpoint.
     """
+    proxy = _proxy_config()
     diag = {
         "order_url": None, "stage": "start", "error": None,
         "final_url": None, "final_title": None, "seats_selected": 0,
         "screenshot_b64": None, "button_labels": None,
+        "using_proxy": proxy is not None,
     }
 
     if not showtime_id:
@@ -122,11 +152,20 @@ async def hold_seat_verbose(
     failed_requests: list[str] = []
     try:
         async with br._page_sem:
-            context = await browser_.new_context(
+            context_kwargs = dict(
                 user_agent=br.BROWSER_UA,
                 viewport={"width": 1400, "height": 1100},
                 locale="en-US",
             )
+            if proxy:
+                context_kwargs["proxy"] = proxy
+            try:
+                context = await browser_.new_context(**context_kwargs)
+            except Exception as exc:
+                diag["stage"] = "launch_browser"
+                diag["error"] = f"Failed to open browser context (bad proxy config?): {exc}"
+                log.error("Hold[%s]: %s", showtime_id, diag["error"])
+                return diag
             page = await context.new_page()
             if debug_screenshot:
                 # Only wired up for the manual debug endpoint — these listeners add
