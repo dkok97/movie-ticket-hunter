@@ -52,6 +52,9 @@ import browser as br
 log = logging.getLogger("odyssey.purchase")
 
 _ORDER_URL_RE = re.compile(r"https://www\.amctheatres\.com/orders/[0-9a-f-]+", re.IGNORECASE)
+_ORDER_UUID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE
+)
 
 # Same accessible/wheelchair-seat detector checker.py uses to keep these out
 # of notifications. Findings passed in from the real auto-hold path already
@@ -308,6 +311,40 @@ async def hold_seat_verbose(
     page.screenshot() call) so it defaults off for the normal auto-hold path
     and is only meant for the manual /api/debug/hold-test endpoint.
     """
+    result = await _hold_seat_verbose_once(
+        showtime_id,
+        seat_names=seat_names,
+        num_seats=num_seats,
+        debug_screenshot=debug_screenshot,
+    )
+    if result.get("order_url"):
+        return result
+    if (
+        result.get("warm_context")
+        and result.get("stage") in ("wait_for_order", "continue_to_order", "add_ticket_type")
+    ):
+        log.info(
+            "Hold[%s]: warm checkout failed at %s — retrying once with fresh context",
+            showtime_id, result.get("stage"),
+        )
+        await invalidate_warm_hold_context(reason="checkout failure retry")
+        retry = await _hold_seat_verbose_once(
+            showtime_id,
+            seat_names=seat_names,
+            num_seats=num_seats,
+            debug_screenshot=debug_screenshot,
+        )
+        retry["retried_after_warm_failure"] = True
+        return retry
+    return result
+
+
+async def _hold_seat_verbose_once(
+    showtime_id: str,
+    seat_names: list[str] | None = None,
+    num_seats: int = 1,
+    debug_screenshot: bool = False,
+) -> dict:
     # Prefer the warm pool's sticky session so using_proxy reflects reality
     # even before we open a page.
     proxy = _proxy_config(session_id=_warm_session_id) if _warm_session_id else _proxy_config()
@@ -421,42 +458,17 @@ async def hold_seat_verbose(
             log.warning("Hold[%s]: %s", showtime_id, diag["error"])
             return await _finish(diag, page, debug_screenshot, console_errors, failed_requests)
 
-        # No fixed sleep — _add_adult_tickets waits for the control itself.
+        await _wait_for_tickets_page(page)
 
-        diag["stage"] = "add_ticket_type"
-        # Ticket-type page can lag behind navigation (slow proxy / hydration).
-        # Waiting for the control + trying a few aria-label variants only
-        # helps — on a fast page wait_for returns immediately.
-        added = await _add_adult_tickets(page, selected)
-        if added == 0:
-            diag["error"] = "'Add Adult Ticket' button not found/clickable on ticket-type page"
-            diag["button_labels"] = await _dump_button_labels(page)
-            log.warning("Hold[%s]: %s (labels seen: %s)", showtime_id, diag["error"], diag["button_labels"])
-            return await _finish(diag, page, debug_screenshot, console_errors, failed_requests)
-
-        diag["stage"] = "continue_to_order"
-        if not await _click_continue(page):
-            diag["error"] = "'Continue' button not found/clickable after choosing ticket type"
-            diag["button_labels"] = await _dump_button_labels(page)
-            log.warning("Hold[%s]: %s", showtime_id, diag["error"])
-            return await _finish(diag, page, debug_screenshot, console_errors, failed_requests)
-
-        diag["stage"] = "wait_for_order"
-        try:
-            await page.wait_for_url(re.compile(r".*/orders/.*"), timeout=20000)
-        except Exception:
-            pass
-        final_url = page.url
-
-        if "/orders/" not in final_url:
-            diag["error"] = "never reached an /orders/ URL after checkout (blocked/redirected?)"
+        order_url = await _complete_ticket_checkout(
+            page, showtime_id=showtime_id, num_adult=selected, diag=diag,
+        )
+        if not order_url:
             log.warning(
-                "Hold[%s]: %s — landed on %s", showtime_id, diag["error"], final_url,
+                "Hold[%s]: %s — landed on %s",
+                showtime_id, diag.get("error"), page.url,
             )
             return await _finish(diag, page, debug_screenshot, console_errors, failed_requests)
-
-        m = _ORDER_URL_RE.match(final_url)
-        order_url = m.group(0) if m else final_url
         diag["stage"] = "done"
         diag["order_url"] = order_url
         log.info(
@@ -490,12 +502,16 @@ async def hold_seat_verbose(
         # hold gets a fresh sticky IP instead of a poisoned session.
         title_l = (final_title or "").lower()
         err_l = (diag.get("error") or "").lower()
-        if (
+        blocked_page = (
             "cloudflare" in title_l
             or "attention required" in title_l
             or "you have been blocked" in title_l
-            or "blocked" in err_l
-        ):
+        )
+        blocked_error = any(
+            phrase in err_l
+            for phrase in ("you have been blocked", "cloudflare", "attention required")
+        )
+        if blocked_page or blocked_error:
             await invalidate_warm_hold_context(reason=final_title or diag.get("error") or "blocked")
         elif not owns_context and context is not None:
             # Keep the sticky proxy/TCP warm, but drop checkout cookies so the
@@ -557,6 +573,170 @@ async def _dismiss_cookie_banner(page):
             await page.locator(sel).first.click(timeout=2000)
         except Exception:
             continue
+
+
+def _order_url_from_graph_body(body: str) -> str | None:
+    """Best-effort: pull a guest order URL out of a graph.amctheatres.com body."""
+    if not body:
+        return None
+    m = _ORDER_URL_RE.search(body)
+    if m:
+        return m.group(0)
+    m = re.search(
+        r'"(?:orderId|orderUUID|order_id)"\s*:\s*"([0-9a-f-]{36})"',
+        body,
+        re.IGNORECASE,
+    )
+    if m:
+        return f"https://www.amctheatres.com/orders/{m.group(1)}"
+    if re.search(r"createOrder|submitOrder|placeOrder", body, re.IGNORECASE):
+        m = _ORDER_UUID_RE.search(body)
+        if m:
+            return f"https://www.amctheatres.com/orders/{m.group(0)}"
+    return None
+
+
+def _order_url_from_page(page) -> str | None:
+    try:
+        m = _ORDER_URL_RE.search(page.url)
+        return m.group(0) if m else None
+    except Exception:
+        return None
+
+
+def _is_graph_post(response) -> bool:
+    return (
+        "graph.amctheatres.com" in response.url
+        and response.request.method == "POST"
+    )
+
+
+async def _wait_for_tickets_page(page) -> None:
+    """Wait until the seats→tickets navigation has actually landed."""
+    try:
+        await page.wait_for_url(re.compile(r".*/tickets.*"), timeout=15000)
+    except Exception:
+        pass
+    combined = ", ".join(_ADD_ADULT_TICKET_SELECTORS)
+    try:
+        await page.wait_for_selector(combined, timeout=15000)
+    except Exception:
+        await page.wait_for_timeout(2000)
+
+
+async def _wait_for_continue_enabled(page, timeout: int = 12000) -> bool:
+    """Ticket-type Continue stays disabled until at least one ticket is added."""
+    try:
+        await page.wait_for_function(
+            """() => {
+                const nodes = Array.from(document.querySelectorAll('button, [role="button"]'));
+                const btn = nodes.find(el => /continue/i.test((el.textContent || '').trim()));
+                return !!(btn && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true');
+            }""",
+            timeout=timeout,
+        )
+        return True
+    except Exception:
+        return False
+
+
+async def _recover_tickets_page(page, showtime_id: str) -> bool:
+    """Reload the ticket-type step after a failed Graph/checkout attempt."""
+    url = page.url if "/tickets" in page.url else (
+        f"https://www.amctheatres.com/showtimes/{showtime_id}/tickets"
+    )
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        await _wait_for_tickets_page(page)
+        return True
+    except Exception as exc:
+        log.warning("Hold[%s]: tickets page reload failed (%s)", showtime_id, exc)
+        return False
+
+
+async def _click_continue_and_create_order(page) -> str | None:
+    """Click Continue on the ticket-type page and return an order URL.
+
+    AMC creates guest orders via a graph.amctheatres.com POST. The SPA
+    normally navigates to /orders/{uuid}, but intermittent CDN 403s on
+    Next.js chunks can leave us on /tickets even when the Graph call
+    succeeded — so we listen for the Graph response and synthesize the
+    order URL from its body when the client-side router doesn't fire.
+    """
+    await _wait_for_continue_enabled(page)
+    graph_body = ""
+    order_url = None
+
+    try:
+        async with page.expect_response(_is_graph_post, timeout=12000) as resp_info:
+            if not await _click_continue(page):
+                return None
+        resp = await resp_info.value
+        try:
+            graph_body = await resp.text()
+        except Exception:
+            pass
+        if resp.status < 400:
+            order_url = _order_url_from_graph_body(graph_body)
+        else:
+            log.warning(
+                "Graph checkout POST returned HTTP %s (body_len=%d)",
+                resp.status, len(graph_body),
+            )
+    except Exception:
+        pass
+
+    if not order_url:
+        try:
+            await page.wait_for_url(re.compile(r".*/orders/.*"), timeout=10000)
+        except Exception:
+            pass
+        order_url = _order_url_from_page(page)
+
+    if not order_url and graph_body:
+        order_url = _order_url_from_graph_body(graph_body)
+    return order_url
+
+
+async def _complete_ticket_checkout(
+    page,
+    *,
+    showtime_id: str,
+    num_adult: int,
+    diag: dict,
+) -> str | None:
+    """Add ticket type(s) and submit through to a guest order URL."""
+    for attempt in range(1, 3):
+        diag["stage"] = "add_ticket_type"
+        added = await _add_adult_tickets(page, num_adult)
+        if added == 0:
+            if attempt < 2 and await _recover_tickets_page(page, showtime_id):
+                continue
+            diag["error"] = "'Add Adult Ticket' button not found/clickable on ticket-type page"
+            diag["button_labels"] = await _dump_button_labels(page)
+            return None
+
+        diag["stage"] = "continue_to_order"
+        order_url = await _click_continue_and_create_order(page)
+        if order_url:
+            diag["stage"] = "wait_for_order"
+            return order_url
+
+        diag["stage"] = "wait_for_order"
+        if attempt < 2:
+            log.warning(
+                "Hold[%s]: checkout attempt %d failed on %s — reloading tickets page",
+                showtime_id, attempt, page.url,
+            )
+            if not await _recover_tickets_page(page, showtime_id):
+                break
+        else:
+            diag["error"] = (
+                "never reached an /orders/ URL after checkout "
+                "(graph API failed or client navigation did not complete)"
+            )
+
+    return None
 
 
 async def _click_continue(page) -> bool:
