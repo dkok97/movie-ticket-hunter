@@ -136,10 +136,9 @@ async def hold_seat_verbose(
             diag["stage"] = "add_ticket_type"
             added = 0
             for _ in range(selected):
-                try:
-                    await page.click('button[aria-label="Add Adult Ticket"]', timeout=8000)
+                if await _robust_click(page, 'button[aria-label="Add Adult Ticket"]'):
                     added += 1
-                except Exception:
+                else:
                     break
             if added == 0:
                 diag["error"] = "'Add Adult Ticket' button not found/clickable on ticket-type page"
@@ -215,17 +214,37 @@ async def _dismiss_cookie_banner(page):
 
 
 async def _click_continue(page) -> bool:
-    """Click the 'Continue' button, retrying once after a short wait — the
-    button can take a moment to become enabled after a selection changes,
-    especially under Railway's slower/shared CPU."""
-    for attempt_timeout in (8000, 12000):
-        try:
-            await page.click("text=Continue", timeout=attempt_timeout)
-            return True
-        except Exception:
-            await page.wait_for_timeout(1000)
-            continue
-    return False
+    """Click the 'Continue' button — a real click first, falling back to a
+    JS-dispatched click on the same element.
+
+    Confirmed on a live deployment: the seat map can render at a wildly
+    broken scale in some headless-Chromium/Docker environments (one seat
+    icon filling the whole viewport) even though the underlying DOM/data is
+    fine — likely a font or GPU/canvas rendering difference vs. a desktop
+    browser. That pushes real UI like the 'Continue' bar out of Playwright's
+    actionable (visible, in-viewport, unobstructed) area, so a normal click
+    times out even though the button exists and works. We already click seat
+    checkboxes the same way, so do it here too rather than depend on visual
+    layout being correct.
+    """
+    return await _robust_click(page, "text=Continue")
+
+
+async def _robust_click(page, selector: str, timeout: int = 8000) -> bool:
+    try:
+        await page.click(selector, timeout=timeout)
+        return True
+    except Exception:
+        pass
+    try:
+        loc = page.locator(selector).first
+        if await loc.count() == 0:
+            return False
+        await loc.scroll_into_view_if_needed()
+        await loc.evaluate("el => el.click()")
+        return True
+    except Exception:
+        return False
 
 
 async def _select_seats(page, seat_names: list[str], num_seats: int) -> int:
