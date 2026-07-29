@@ -72,6 +72,12 @@ DEFAULT_CONFIG: dict = {
     "use_browser": True,
     # How many dates to check concurrently per cycle.
     "max_concurrency": 4,
+    # Check the first N days of the range to completion *before* the rest, so
+    # near-term cancellations are found (and held) minutes earlier in a cycle.
+    "priority_days": 3,
+    # Cap guest-checkout holds per cycle — each hold burns proxy + ~30–60s.
+    # Rank by soonest show_date; remaining findings still get seat-map alerts.
+    "max_holds_per_cycle": 2,
     # Max seat-map lookups per date (each is a browser round-trip). High enough
     # to verify every showtime of a day; overall browser load is bounded by the
     # global browser concurrency cap (BROWSER_CONCURRENCY env, default 4).

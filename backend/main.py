@@ -8,6 +8,7 @@ and sends push notifications via ntfy.sh the moment seats open up.
 import asyncio
 import json
 import logging
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -44,14 +45,35 @@ _is_running = False  # guard to prevent concurrent runs
 # by the global browser concurrency cap.
 CHECK_TIMEOUT_SECONDS = 900
 
-# Signatures of showtimes we've already alerted on. We only notify when a
-# showtime *newly* has open seats. If a showtime sells out and later opens
-# again, its signature drops out of this set and we re-alert.
+# Signatures of findings we've already alerted on. Includes the open-seat
+# set so a showtime that gains *different* seats later re-alerts. If a
+# showtime sells out entirely, its sig drops out of this set and we re-alert
+# when seats open again.
 _notified_signatures: set[str] = set()
+
+# How many guest-checkout holds we've attempted in the current cycle
+# (reset at the start of each scheduled_check). Caps proxy burn.
+_holds_this_cycle: int = 0
 
 
 def _finding_signature(f: dict) -> str:
-    """Stable key for a showtime: date + time + theatre."""
+    """Stable key: date + time + theatre + open seats.
+
+    Seat names are sorted so map order doesn't cause spurious re-alerts; a
+    *changed* seat set (new cancellation) does re-alert.
+    """
+    seats = f.get("available_seats") or []
+    seat_key = ",".join(sorted(str(s) for s in seats))
+    return "|".join([
+        str(f.get("show_date", "")),
+        str(f.get("showtime", "")),
+        str(f.get("theatre_name", "")),
+        seat_key,
+    ])
+
+
+def _showtime_prefix(f: dict) -> str:
+    """date|time|theatre — identity of a showtime ignoring which seats are open."""
     return "|".join([
         str(f.get("show_date", "")),
         str(f.get("showtime", "")),
@@ -59,71 +81,137 @@ def _finding_signature(f: dict) -> str:
     ])
 
 
+def _showtime_sort_key(showtime: str) -> int:
+    """Minutes from midnight for strings like '2:00pm' / '10:00 am' / '14:00'."""
+    s = (showtime or "").strip().lower().replace(" ", "")
+    m = re.match(r"^(\d{1,2}):(\d{2})(am|pm)?$", s)
+    if not m:
+        return 99_999
+    hour, minute = int(m.group(1)), int(m.group(2))
+    ampm = m.group(3)
+    if ampm == "pm" and hour != 12:
+        hour += 12
+    elif ampm == "am" and hour == 12:
+        hour = 0
+    return hour * 60 + minute
+
+
+def _rank_findings(findings: list[dict]) -> list[dict]:
+    """Soonest show_date first, then earliest showtime — best hold targets."""
+    return sorted(
+        findings,
+        key=lambda f: (
+            str(f.get("show_date") or "9999-99-99"),
+            _showtime_sort_key(str(f.get("showtime") or "")),
+        ),
+    )
+
+
+async def _process_new_findings(findings: list[dict], *, label: str = "") -> int:
+    """Filter to newly-seen findings, hold the best few, notify.
+
+    Returns how many findings were newly alerted. Safe to call mid-cycle
+    (priority batch) and again at end — signatures prevent double-notify.
+    """
+    global _holds_this_cycle
+
+    if not findings:
+        return 0
+
+    new_findings = [
+        f for f in findings if _finding_signature(f) not in _notified_signatures
+    ]
+    if not new_findings:
+        return 0
+
+    require_standard = str(
+        cfg.get("require_standard_seats", True)
+    ).lower() not in ("false", "0", "no")
+    if require_standard:
+        verified = [
+            f for f in new_findings
+            if f.get("available_seats")
+            and "(seats unverified)" not in str(f.get("seat_summary", ""))
+        ]
+        skipped = len(new_findings) - len(verified)
+        if skipped:
+            log.warning(
+                "Skipping notify for %d unverified finding(s)%s",
+                skipped, f" ({label})" if label else "",
+            )
+        new_findings = verified
+
+    if not new_findings:
+        return 0
+
+    try:
+        max_holds = max(0, int(cfg.get("max_holds_per_cycle", 2) or 2))
+    except (TypeError, ValueError):
+        max_holds = 2
+    remaining_holds = max(0, max_holds - _holds_this_cycle)
+    to_hold = _rank_findings(new_findings)[:remaining_holds]
+
+    _notified_signatures.update(_finding_signature(f) for f in new_findings)
+    log.info(
+        "🎟️  %d new open showtime(s)%s — holding %d soonest, notifying all...",
+        len(new_findings),
+        f" [{label}]" if label else "",
+        len(to_hold),
+    )
+    if to_hold:
+        await _hold_seats_for_findings(to_hold)
+        _holds_this_cycle += len(to_hold)
+    await notifier.send_ticket_alert(new_findings)
+    return len(new_findings)
+
+
 async def scheduled_check():
     """Runs as a scheduled job — perform a full ticket check cycle."""
-    global _is_running
+    global _is_running, _holds_this_cycle, _notified_signatures
     if _is_running:
         log.info("Check already in progress, skipping this cycle.")
         return
 
     _is_running = True
+    _holds_this_cycle = 0
     run_id = db.create_run()
 
     try:
         log.info("=== Starting scheduled check (run #%d) ===", run_id)
+
+        async def on_priority_findings(batch: list[dict]):
+            """Hold/notify as soon as near-term dates finish — don't wait for
+            the rest of the date range to finish scraping."""
+            db.save_findings(run_id, batch)
+            await _process_new_findings(batch, label="priority")
+
         # Watchdog: never let a single cycle hang forever (e.g. a stalled
         # request), which would otherwise block all future cycles.
         findings, sources, details = await asyncio.wait_for(
-            checker.run_all_checks(), timeout=CHECK_TIMEOUT_SECONDS
+            checker.run_all_checks(on_priority_findings=on_priority_findings),
+            timeout=CHECK_TIMEOUT_SECONDS,
         )
 
         db.complete_run(run_id, sources, len(findings), details)
 
         if findings:
             db.save_findings(run_id, findings)
+            # Drop signatures for showtimes no longer open so a full sell-out
+            # followed by a new cancellation re-alerts.
+            live_prefixes = {_showtime_prefix(f) for f in findings}
+            _notified_signatures = {
+                sig for sig in _notified_signatures
+                if "|".join(sig.split("|")[:3]) in live_prefixes
+            }
 
-            # Only notify for showtimes we haven't already alerted on.
-            current_sigs = {_finding_signature(f) for f in findings}
-            new_findings = [
-                f for f in findings if _finding_signature(f) not in _notified_signatures
-            ]
-            # Forget showtimes that are no longer available so they re-alert
-            # if seats open up again later.
-            _notified_signatures.intersection_update(current_sigs)
-
-            if new_findings:
-                # Defense in depth: never alert on unverified showtimes when we
-                # require confirmed standard seats (legacy fail-open paths).
-                require_standard = str(
-                    cfg.get("require_standard_seats", True)
-                ).lower() not in ("false", "0", "no")
-                if require_standard:
-                    verified = [
-                        f for f in new_findings
-                        if f.get("available_seats")
-                        and "(seats unverified)" not in str(f.get("seat_summary", ""))
-                    ]
-                    skipped = len(new_findings) - len(verified)
-                    if skipped:
-                        log.warning(
-                            "Skipping notify for %d unverified finding(s)", skipped
-                        )
-                    new_findings = verified
-
-            if new_findings:
-                _notified_signatures.update(_finding_signature(f) for f in new_findings)
-                log.info(
-                    "🎟️  %d open showtime(s), %d new! Sending notification...",
-                    len(findings), len(new_findings),
-                )
-                await _hold_seats_for_findings(new_findings)
-                await notifier.send_ticket_alert(new_findings)
-            else:
+            n = await _process_new_findings(findings, label="full")
+            if n == 0:
                 log.info(
                     "%d open showtime(s), all previously alerted or unverified — no new notification.",
                     len(findings),
                 )
         else:
+            _notified_signatures.clear()
             log.info("No open seats found this cycle.")
 
     except Exception as exc:
@@ -135,17 +223,12 @@ async def scheduled_check():
 
 
 async def _hold_seats_for_findings(findings: list[dict]):
-    """Best-effort: for each newly-found showtime, drive AMC's guest checkout
-    far enough to create a real order (holding the seat for several minutes)
-    and attach the order URL to the finding so the notification can link
-    straight to "finish paying" instead of "go find the seat yourself".
-
-    Never raises — a hold is a nice-to-have speed boost, not a requirement,
-    and AMC availability/Cloudflare can make it fail for reasons outside our
-    control. Findings without a hold just fall back to the regular showtime
-    link in the notification.
+    """Best-effort: for each finding, drive AMC guest checkout far enough to
+    mint a real order URL (holding the seat). Never raises.
     """
     if str(cfg.get("auto_hold_seats", True)).lower() in ("false", "0", "no"):
+        return
+    if not findings:
         return
 
     import purchase
@@ -155,7 +238,7 @@ async def _hold_seats_for_findings(findings: list[dict]):
     except (TypeError, ValueError):
         num_seats = 1
 
-    sem = asyncio.Semaphore(2)  # a few real browser checkouts in flight at once, at most
+    sem = asyncio.Semaphore(2)
 
     async def _hold(f: dict):
         showtime_id = f.get("showtime_id", "")
@@ -177,10 +260,6 @@ async def _hold_seats_for_findings(findings: list[dict]):
             if diag.get("order_url"):
                 f["order_url"] = diag["order_url"]
             else:
-                # Logged at stage-specific WARNING level inside purchase.py too, but
-                # summarise here with the full diagnostics for quick triage — this
-                # is the line to grep server logs for when holds mysteriously never
-                # show up in notifications.
                 log.warning(
                     "No hold for showtime %s: stage=%s error=%s final_url=%s final_title=%s",
                     showtime_id, diag.get("stage"), diag.get("error"),
@@ -276,6 +355,8 @@ class ConfigUpdate(BaseModel):
     require_standard_seats: bool | None = None
     use_browser: bool | None = None
     auto_hold_seats: bool | None = None
+    priority_days: int | None = None
+    max_holds_per_cycle: int | None = None
     theatres: list[dict] | None = None
 
 

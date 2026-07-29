@@ -1637,11 +1637,19 @@ def _is_evening_time(text: str, evening_hour: int = 16) -> bool:
 # Main check orchestrator
 # ===========================================================================
 
-async def run_all_checks() -> tuple[list[dict], list[str], str]:
+async def run_all_checks(
+    *,
+    on_priority_findings=None,
+) -> tuple[list[dict], list[str], str]:
     """Run checks across all configured theatres, sources, and dates.
 
     Sweeps every date in the configured range (start_date..end_date) so we
     catch open seats at any showtime over the coming weeks.
+
+    Near-term dates (`priority_days`, default 3) are checked to completion
+    *before* the rest of the range. If ``on_priority_findings`` is provided,
+    it is awaited with those findings so the caller can hold/notify while the
+    remaining dates are still being swept.
 
     Returns (findings, sources_checked, details_summary).
     """
@@ -1651,55 +1659,97 @@ async def run_all_checks() -> tuple[list[dict], list[str], str]:
     dates = cfg.get_date_range()
     theatres = cfg.get_theatres()
 
+    try:
+        priority_days = max(0, int(conf.get("priority_days", 3) or 3))
+    except (TypeError, ValueError):
+        priority_days = 3
+    priority_dates = dates[:priority_days]
+    rest_dates = dates[priority_days:]
+
     label = f"{movie_name}" + (f" ({movie_format})" if movie_format else "")
     log.info(
-        "Sweeping %d date(s) %s..%s across %d theatre(s) for '%s'",
+        "Sweeping %d date(s) %s..%s across %d theatre(s) for '%s' "
+        "(priority first: %d day(s)%s)",
         len(dates), dates[0] if dates else "?", dates[-1] if dates else "?",
-        len(theatres), label,
+        len(theatres), label, len(priority_dates),
+        f" {priority_dates[0]}..{priority_dates[-1]}" if priority_dates else "",
     )
 
     all_findings: list[dict] = []
     sources_checked: list[str] = []
     details_lines: list[str] = []
+    any_error = False
 
     # Bound concurrency so a wide date range doesn't hammer AMC (or spawn too
     # many browser contexts) all at once, while still finishing a cycle quickly.
     sem = asyncio.Semaphore(int(conf.get("max_concurrency", 4) or 4))
 
+    async def _check_one(theatre: dict, target_date: str) -> list[dict] | None:
+        source = theatre.get("source", "amc")
+        theatre_name = theatre.get("name", "Unknown")
+        async with sem:
+            try:
+                if source == "amc":
+                    findings = await check_amc(theatre, movie_name, target_date)
+                elif source == "fandango":
+                    findings = await check_fandango(theatre, movie_name, target_date)
+                else:
+                    log.warning("Unknown source: %s", source)
+                    return None
+                for f in findings:
+                    f.setdefault("show_date", target_date)
+                return findings
+            except Exception as exc:
+                log.error("Error checking %s on %s: %s", theatre_name, target_date, exc)
+                return None
+
+    async def _phase(phase_dates: list[str]) -> list[dict]:
+        nonlocal any_error
+        if not phase_dates:
+            return []
+        tasks = [
+            _check_one(theatre, d)
+            for theatre in theatres
+            for d in phase_dates
+        ]
+        results = await asyncio.gather(*tasks)
+        phase_findings: list[dict] = []
+        for r in results:
+            if r is None:
+                any_error = True
+            else:
+                phase_findings.extend(r)
+        return phase_findings
+
+    # Phase 1 — near-term dates. Kick off hold/notify in the background so
+    # phase 2 can scrape further-out dates in parallel with the (slow) hold.
+    priority_findings = await _phase(priority_dates)
+    all_findings.extend(priority_findings)
+    priority_cb_task = None
+    if on_priority_findings and priority_findings:
+        async def _safe_priority_cb(batch=priority_findings):
+            try:
+                await on_priority_findings(batch)
+            except Exception as exc:
+                log.warning("on_priority_findings callback failed: %s", exc)
+
+        priority_cb_task = asyncio.create_task(_safe_priority_cb())
+
+    # Phase 2 — remaining dates in the configured range.
+    rest_findings = await _phase(rest_dates)
+    all_findings.extend(rest_findings)
+
+    if priority_cb_task is not None:
+        await priority_cb_task
+
     for theatre in theatres:
         source = theatre.get("source", "amc")
         theatre_name = theatre.get("name", "Unknown")
-
-        async def _check_date(target_date: str):
-            async with sem:
-                try:
-                    if source == "amc":
-                        findings = await check_amc(theatre, movie_name, target_date)
-                    elif source == "fandango":
-                        findings = await check_fandango(theatre, movie_name, target_date)
-                    else:
-                        log.warning("Unknown source: %s", source)
-                        return None
-                    for f in findings:
-                        f.setdefault("show_date", target_date)
-                    return findings
-                except Exception as exc:
-                    log.error("Error checking %s on %s: %s", theatre_name, target_date, exc)
-                    return None  # sentinel for error
-
-        results = await asyncio.gather(*[_check_date(d) for d in dates])
-
-        theatre_findings: list[dict] = []
-        errored = False
-        for r in results:
-            if r is None:
-                errored = True
-            else:
-                theatre_findings.extend(r)
-
-        suffix = " (partial error)" if errored else ""
+        theatre_findings = [
+            f for f in all_findings if f.get("theatre_name") == theatre_name
+        ]
+        suffix = " (partial error)" if any_error else ""
         sources_checked.append(f"{source}:{theatre_name}{suffix}")
-        all_findings.extend(theatre_findings)
 
         if theatre_findings:
             span = f"{dates[0]}→{dates[-1]}" if dates else ""
@@ -1707,7 +1757,6 @@ async def run_all_checks() -> tuple[list[dict], list[str], str]:
                 f"✅ {theatre_name}: {len(theatre_findings)} open showtime(s) "
                 f"across {len(dates)} date(s) {span}".strip()
             )
-            # Show only a short preview; full list is in /api/findings.
             preview = 5
             for f in theatre_findings[:preview]:
                 status = f.get("status", "")
