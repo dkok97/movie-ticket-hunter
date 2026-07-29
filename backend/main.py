@@ -421,7 +421,7 @@ async def debug_hold_test(showtime_id: str = "", ticket_url: str = "", num_seats
 
     try:
         result = await asyncio.wait_for(
-            purchase.hold_seat_verbose(showtime_id, num_seats=num_seats),
+            purchase.hold_seat_verbose(showtime_id, num_seats=num_seats, debug_screenshot=True),
             timeout=90,
         )
     except asyncio.TimeoutError:

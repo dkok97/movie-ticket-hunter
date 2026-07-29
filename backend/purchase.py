@@ -27,6 +27,7 @@ to make that failure mode diagnosable from the deployed environment without
 needing full server log access.
 """
 
+import base64
 import logging
 import re
 
@@ -54,6 +55,7 @@ async def hold_seat_verbose(
     showtime_id: str,
     seat_names: list[str] | None = None,
     num_seats: int = 1,
+    debug_screenshot: bool = False,
 ) -> dict:
     """Select up to `num_seats` open seats (preferring `seat_names`, in
     order, when they're still open) and create a guest AMC order.
@@ -65,12 +67,20 @@ async def hold_seat_verbose(
         "error": str | None,       # exception message, if any
         "final_url": str | None,   # whatever URL the browser ended up on
         "final_title": str | None, # that page's <title>, if we could read it
+        "seats_selected": int,     # how many seat checkboxes we actually clicked
+        "screenshot_b64": str | None,  # only set if debug_screenshot=True and it failed
       }
 
     This never raises — callers that only want the URL should use
-    `hold_seat` instead.
+    `hold_seat` instead. `debug_screenshot` adds real overhead (an extra
+    page.screenshot() call) so it defaults off for the normal auto-hold path
+    and is only meant for the manual /api/debug/hold-test endpoint.
     """
-    diag = {"order_url": None, "stage": "start", "error": None, "final_url": None, "final_title": None}
+    diag = {
+        "order_url": None, "stage": "start", "error": None,
+        "final_url": None, "final_title": None, "seats_selected": 0,
+        "screenshot_b64": None,
+    }
 
     if not showtime_id:
         diag["error"] = "no showtime_id given"
@@ -109,16 +119,17 @@ async def hold_seat_verbose(
 
             diag["stage"] = "select_seats"
             selected = await _select_seats(page, seat_names, num_seats)
+            diag["seats_selected"] = selected
             if selected == 0:
                 diag["error"] = "no open/selectable seat checkboxes found on the live page"
                 log.warning("Hold[%s]: %s (sold out, or page shape changed)", showtime_id, diag["error"])
-                return await _finish(diag, page)
+                return await _finish(diag, page, debug_screenshot)
 
             diag["stage"] = "continue_to_tickets"
             if not await _click_continue(page):
                 diag["error"] = "'Continue' button not found/clickable after selecting seat(s)"
                 log.warning("Hold[%s]: %s", showtime_id, diag["error"])
-                return await _finish(diag, page)
+                return await _finish(diag, page, debug_screenshot)
 
             await page.wait_for_timeout(1500)
 
@@ -126,20 +137,20 @@ async def hold_seat_verbose(
             added = 0
             for _ in range(selected):
                 try:
-                    await page.click('button[aria-label="Add Adult Ticket"]', timeout=5000)
+                    await page.click('button[aria-label="Add Adult Ticket"]', timeout=8000)
                     added += 1
                 except Exception:
                     break
             if added == 0:
                 diag["error"] = "'Add Adult Ticket' button not found/clickable on ticket-type page"
                 log.warning("Hold[%s]: %s", showtime_id, diag["error"])
-                return await _finish(diag, page)
+                return await _finish(diag, page, debug_screenshot)
 
             diag["stage"] = "continue_to_order"
             if not await _click_continue(page):
                 diag["error"] = "'Continue' button not found/clickable after choosing ticket type"
                 log.warning("Hold[%s]: %s", showtime_id, diag["error"])
-                return await _finish(diag, page)
+                return await _finish(diag, page, debug_screenshot)
 
             diag["stage"] = "wait_for_order"
             try:
@@ -153,18 +164,18 @@ async def hold_seat_verbose(
                 log.warning(
                     "Hold[%s]: %s — landed on %s", showtime_id, diag["error"], final_url,
                 )
-                return await _finish(diag, page)
+                return await _finish(diag, page, debug_screenshot)
 
             m = _ORDER_URL_RE.match(final_url)
             order_url = m.group(0) if m else final_url
             diag["stage"] = "done"
             diag["order_url"] = order_url
             log.info("Held %d seat(s) for showtime %s -> %s", selected, showtime_id, order_url)
-            return await _finish(diag, page)
+            return await _finish(diag, page, debug_screenshot=False)
     except Exception as exc:
         diag["error"] = f"{type(exc).__name__}: {exc}"
         log.error("Hold[%s]: failed at stage=%s: %s", showtime_id, diag["stage"], exc)
-        return await _finish(diag, page)
+        return await _finish(diag, page, debug_screenshot)
     finally:
         if context is not None:
             try:
@@ -173,8 +184,9 @@ async def hold_seat_verbose(
                 pass
 
 
-async def _finish(diag: dict, page) -> dict:
-    """Best-effort: capture where the browser ended up, for diagnostics."""
+async def _finish(diag: dict, page, debug_screenshot: bool = False) -> dict:
+    """Best-effort: capture where the browser ended up (and, on failure when
+    requested, a screenshot) for diagnostics."""
     if page is not None:
         try:
             diag["final_url"] = page.url
@@ -184,6 +196,12 @@ async def _finish(diag: dict, page) -> dict:
             diag["final_title"] = await page.title()
         except Exception:
             pass
+        if debug_screenshot and diag.get("order_url") is None:
+            try:
+                png = await page.screenshot(full_page=False)
+                diag["screenshot_b64"] = base64.b64encode(png).decode("ascii")
+            except Exception:
+                pass
     return diag
 
 
@@ -197,11 +215,17 @@ async def _dismiss_cookie_banner(page):
 
 
 async def _click_continue(page) -> bool:
-    try:
-        await page.click("text=Continue", timeout=8000)
-        return True
-    except Exception:
-        return False
+    """Click the 'Continue' button, retrying once after a short wait — the
+    button can take a moment to become enabled after a selection changes,
+    especially under Railway's slower/shared CPU."""
+    for attempt_timeout in (8000, 12000):
+        try:
+            await page.click("text=Continue", timeout=attempt_timeout)
+            return True
+        except Exception:
+            await page.wait_for_timeout(1000)
+            continue
+    return False
 
 
 async def _select_seats(page, seat_names: list[str], num_seats: int) -> int:
