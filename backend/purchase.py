@@ -116,7 +116,11 @@ def _proxy_config() -> dict | None:
     if password and os.environ.get("HOLD_PROXY_STICKY", "1").strip() not in ("0", "false", "False"):
         country = os.environ.get("HOLD_PROXY_COUNTRY", "us").strip()
         state = os.environ.get("HOLD_PROXY_STATE", "newyork").strip()
-        city = os.environ.get("HOLD_PROXY_CITY", "newyork").strip()
+        # Confirmed via curl against IPRoyal directly (2026-07-29): "newyork"
+        # is a valid *state* value but not a valid *city* value (503, no
+        # matching exit nodes) — the city has to be "newyorkcity" (or e.g.
+        # "manhattan"/"brooklyn"). Don't reuse the state's spelling here.
+        city = os.environ.get("HOLD_PROXY_CITY", "newyorkcity").strip()
         lifetime = os.environ.get("HOLD_PROXY_STICKY_LIFETIME", "15m").strip()
         parts = [password]
         if country:

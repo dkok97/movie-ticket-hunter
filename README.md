@@ -160,7 +160,7 @@ HOLD_PROXY_PASSWORD=your_proxy_password
 # HOLD_PROXY_STICKY=0 to disable if your provider isn't IPRoyal.
 HOLD_PROXY_COUNTRY=us
 HOLD_PROXY_STATE=newyork
-HOLD_PROXY_CITY=newyork
+HOLD_PROXY_CITY=newyorkcity
 HOLD_PROXY_STICKY_LIFETIME=15m
 ```
 
