@@ -37,6 +37,17 @@ log = logging.getLogger("odyssey.purchase")
 
 _ORDER_URL_RE = re.compile(r"https://www\.amctheatres\.com/orders/[0-9a-f-]+", re.IGNORECASE)
 
+# Same accessible/wheelchair-seat detector checker.py uses to keep these out
+# of notifications. Findings passed in from the real auto-hold path already
+# only contain standard seat names, but the debug endpoint can be called with
+# just a showtime_id (no seat_names), so `_select_seats` needs its own guard:
+# a lone wheelchair seat's checkbox is clickable, but AMC's checkout disables
+# 'Continue' for it (it requires a paired companion seat), which otherwise
+# looks just like an unexplained stuck flow.
+_ACCESSIBLE_SEAT_RE = re.compile(
+    r"wheel\s*chair|companion|accessible|handicap|\bada\b", re.IGNORECASE
+)
+
 _CLOSE_BANNER_SELECTORS = ('button[aria-label="Close"]', 'button:has-text("Close")')
 
 
@@ -265,6 +276,8 @@ async def _select_seats(page, seat_names: list[str], num_seats: int) -> int:
                 continue
             label = (await cb.get_attribute("aria-label")) or ""
         except Exception:
+            continue
+        if _ACCESSIBLE_SEAT_RE.search(label):
             continue
         code = label.strip().split(" ")[-1] if label else ""
         open_seats.append((i, code))
