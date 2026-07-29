@@ -54,6 +54,10 @@ _notified_signatures: set[str] = set()
 # How many guest-checkout holds we've attempted in the current cycle
 # (reset at the start of each scheduled_check). Caps proxy burn.
 _holds_this_cycle: int = 0
+_hold_claim_lock = asyncio.Lock()
+# Background hold+notify tasks spawned the instant a seat opens; awaited
+# at end of cycle so we don't exit mid-hold.
+_immediate_tasks: list[asyncio.Task] = []
 
 
 def _finding_signature(f: dict) -> str:
@@ -107,11 +111,51 @@ def _rank_findings(findings: list[dict]) -> list[dict]:
     )
 
 
-async def _process_new_findings(findings: list[dict], *, label: str = "") -> int:
-    """Filter to newly-seen findings, hold the best few, notify.
+async def _on_open_seat(finding: dict, *, run_id: int) -> None:
+    """Called the instant a seat map confirms open seats.
 
-    Returns how many findings were newly alerted. Safe to call mid-cycle
-    (priority batch) and again at end — signatures prevent double-notify.
+    Must return quickly so other showtimes keep verifying. Spawns hold+notify
+    as a background task.
+    """
+    global _holds_this_cycle
+
+    sig = _finding_signature(finding)
+    async with _hold_claim_lock:
+        if sig in _notified_signatures:
+            return
+        _notified_signatures.add(sig)
+        try:
+            max_holds = max(0, int(cfg.get("max_holds_per_cycle", 2) or 2))
+        except (TypeError, ValueError):
+            max_holds = 2
+        should_hold = _holds_this_cycle < max_holds
+        if should_hold:
+            _holds_this_cycle += 1
+
+    log.info(
+        "🎟️  Open seats NOW %s %s @ %s (%s) — %s",
+        finding.get("show_date"),
+        finding.get("showtime"),
+        finding.get("theatre_name"),
+        finding.get("seat_summary", ""),
+        "holding immediately" if should_hold else "notifying (hold cap reached)",
+    )
+
+    async def _hold_and_notify():
+        try:
+            db.save_findings(run_id, [finding])
+            if should_hold:
+                await _hold_seats_for_findings([finding])
+            await notifier.send_ticket_alert([finding])
+        except Exception as exc:
+            log.exception("Immediate hold/notify failed for %s: %s", finding.get("showtime_id"), exc)
+
+    _immediate_tasks.append(asyncio.create_task(_hold_and_notify()))
+
+
+async def _process_new_findings(findings: list[dict], *, label: str = "") -> int:
+    """Notify (and hold if capacity remains) for findings not already handled
+    by the immediate on_open_seat path. Returns newly alerted count.
     """
     global _holds_this_cycle
 
@@ -153,7 +197,7 @@ async def _process_new_findings(findings: list[dict], *, label: str = "") -> int
 
     _notified_signatures.update(_finding_signature(f) for f in new_findings)
     log.info(
-        "🎟️  %d new open showtime(s)%s — holding %d soonest, notifying all...",
+        "🎟️  %d leftover open showtime(s)%s — holding %d, notifying all...",
         len(new_findings),
         f" [{label}]" if label else "",
         len(to_hold),
@@ -167,30 +211,33 @@ async def _process_new_findings(findings: list[dict], *, label: str = "") -> int
 
 async def scheduled_check():
     """Runs as a scheduled job — perform a full ticket check cycle."""
-    global _is_running, _holds_this_cycle, _notified_signatures
+    global _is_running, _holds_this_cycle, _notified_signatures, _immediate_tasks
     if _is_running:
         log.info("Check already in progress, skipping this cycle.")
         return
 
     _is_running = True
     _holds_this_cycle = 0
+    _immediate_tasks = []
     run_id = db.create_run()
 
     try:
         log.info("=== Starting scheduled check (run #%d) ===", run_id)
 
-        async def on_priority_findings(batch: list[dict]):
-            """Hold/notify as soon as near-term dates finish — don't wait for
-            the rest of the date range to finish scraping."""
-            db.save_findings(run_id, batch)
-            await _process_new_findings(batch, label="priority")
+        async def on_open_seat(finding: dict):
+            await _on_open_seat(finding, run_id=run_id)
 
         # Watchdog: never let a single cycle hang forever (e.g. a stalled
         # request), which would otherwise block all future cycles.
         findings, sources, details = await asyncio.wait_for(
-            checker.run_all_checks(on_priority_findings=on_priority_findings),
+            checker.run_all_checks(on_open_seat=on_open_seat),
             timeout=CHECK_TIMEOUT_SECONDS,
         )
+
+        # Let any in-flight immediate holds finish before we finalize the run.
+        if _immediate_tasks:
+            await asyncio.gather(*_immediate_tasks, return_exceptions=True)
+            _immediate_tasks = []
 
         db.complete_run(run_id, sources, len(findings), details)
 
@@ -217,6 +264,9 @@ async def scheduled_check():
     except Exception as exc:
         log.exception("Check failed: %s", exc)
         db.fail_run(run_id, str(exc))
+        if _immediate_tasks:
+            await asyncio.gather(*_immediate_tasks, return_exceptions=True)
+            _immediate_tasks = []
     finally:
         db.gc_runs(keep=100)
         _is_running = False

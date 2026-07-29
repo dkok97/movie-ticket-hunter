@@ -71,7 +71,13 @@ TIMEOUT = httpx.Timeout(20.0, connect=10.0)
 # AMC Checker
 # ===========================================================================
 
-async def check_amc(theatre: dict, movie_name: str, target_date: str) -> list[dict]:
+async def check_amc(
+    theatre: dict,
+    movie_name: str,
+    target_date: str,
+    *,
+    on_open_seat=None,
+) -> list[dict]:
     """Check AMC for ticket availability.
 
     Order (each falls through to the next only if it finds nothing):
@@ -84,6 +90,10 @@ async def check_amc(theatre: dict, movie_name: str, target_date: str) -> list[di
     The AMC Developer API path was removed — we never got an approved key,
     and the 403s just added noise every cycle. Web scraping is the real path.
 
+    If ``on_open_seat`` is provided, it is awaited for each finding the moment
+    its seat map confirms usable open seats (before the rest of that date's
+    showtimes finish verifying) so the caller can hold immediately.
+
     Critically, an empty result from the browser is NOT terminal — we keep
     trying the remaining strategies so one flaky path can't zero out a cycle.
     """
@@ -95,8 +105,12 @@ async def check_amc(theatre: dict, movie_name: str, target_date: str) -> list[di
         """Seat-verify (plain HTTP, then browser fallback) or fail closed."""
         if not findings:
             return findings
+        for f in findings:
+            f.setdefault("show_date", target_date)
         return await _enrich_findings_with_seats(
-            findings, lambda sid: _website_fetch_open_seats(sid, use_browser)
+            findings,
+            lambda sid: _website_fetch_open_seats(sid, use_browser),
+            on_open_seat=on_open_seat,
         )
 
     # Strategy 1: plain-HTTP movie page (fast, and proven to work for this page).
@@ -876,11 +890,22 @@ async def _website_fetch_open_seats(showtime_id: str, use_browser: bool) -> tupl
     return None
 
 
-async def _enrich_findings_with_seats(findings: list[dict], seat_fetcher) -> list[dict]:
+async def _enrich_findings_with_seats(
+    findings: list[dict],
+    seat_fetcher,
+    *,
+    on_open_seat=None,
+) -> list[dict]:
     """Attach seat detail to findings and drop shows without usable seats.
 
     `seat_fetcher` is an async callable taking a showtime_id and returning
     (open_standard, open_accessible) or None (seat data couldn't be read).
+
+    Each showtime's seat map is looked up independently. As soon as one
+    confirms usable open seats, ``on_open_seat(finding)`` is awaited (if
+    provided) *before* waiting on the other showtimes' lookups — so a hold
+    can start within seconds of the first open seat, not after the whole
+    date finishes verifying.
 
     Config:
       report_seats (default on)          — look up seats / include labels
@@ -910,51 +935,60 @@ async def _enrich_findings_with_seats(findings: list[dict], seat_fetcher) -> lis
     max_lookups = int(conf.get("max_seat_lookups", 12) or 12)
     sem = asyncio.Semaphore(int(conf.get("max_concurrency", 4) or 4))
 
-    async def _lookup(idx, f):
-        if idx >= max_lookups:
-            return None  # over budget → unverified
-        async with sem:
-            return await seat_fetcher(f.get("showtime_id", ""))
-
-    results = await asyncio.gather(*[_lookup(i, f) for i, f in enumerate(findings)])
-
-    kept: list[dict] = []
     dropped_ada = 0
     dropped_unverified = 0
     dropped_short = 0
-    for f, result in zip(findings, results):
+    drop_lock = asyncio.Lock()
+
+    async def _process_one(idx: int, f: dict) -> dict | None:
+        nonlocal dropped_ada, dropped_unverified, dropped_short
+        if idx >= max_lookups:
+            result = None
+        else:
+            async with sem:
+                result = await seat_fetcher(f.get("showtime_id", ""))
+
         if result is None:
-            # Couldn't read seats. Fail closed when we require real seats —
-            # otherwise AMC's bookable-but-ADA-only showtimes flood alerts.
             if require_standard:
-                dropped_unverified += 1
-                continue
+                async with drop_lock:
+                    dropped_unverified += 1
+                return None
             f["seat_summary"] = "(seats unverified)"
-            kept.append(f)
-            continue
+            return f
 
         open_std, open_acc = result
         usable = open_std if exclude_accessible else (open_std + open_acc)
 
         if not usable:
-            # Positively determined: only accessible seats (or none) remain.
             if require_standard:
-                dropped_ada += 1
-                continue
+                async with drop_lock:
+                    dropped_ada += 1
+                return None
             f["seat_summary"] = f"only accessible seats ({len(open_acc)})"
-            kept.append(f)
-            continue
+            return f
 
         if len(usable) < min_seats:
-            dropped_short += 1
-            continue
+            async with drop_lock:
+                dropped_short += 1
+            return None
 
         preview = ", ".join(usable[:12]) + ("…" if len(usable) > 12 else "")
         f["available_seats"] = usable
         f["seat_summary"] = f"{len(usable)} open seat(s): {preview}"
         if exclude_accessible and open_acc:
             f["seat_summary"] += f" (excluded {len(open_acc)} accessible)"
-        kept.append(f)
+
+        # Fire immediately — do not wait for sibling showtimes to finish.
+        if on_open_seat is not None:
+            try:
+                await on_open_seat(f)
+            except Exception as exc:
+                log.warning("on_open_seat callback failed for %s: %s", f.get("showtime_id"), exc)
+
+        return f
+
+    results = await asyncio.gather(*[_process_one(i, f) for i, f in enumerate(findings)])
+    kept = [r for r in results if r is not None]
 
     if dropped_ada:
         log.info("Dropped %d show(s) with only accessible seats", dropped_ada)
@@ -1639,7 +1673,7 @@ def _is_evening_time(text: str, evening_hour: int = 16) -> bool:
 
 async def run_all_checks(
     *,
-    on_priority_findings=None,
+    on_open_seat=None,
 ) -> tuple[list[dict], list[str], str]:
     """Run checks across all configured theatres, sources, and dates.
 
@@ -1647,9 +1681,11 @@ async def run_all_checks(
     catch open seats at any showtime over the coming weeks.
 
     Near-term dates (`priority_days`, default 3) are checked to completion
-    *before* the rest of the range. If ``on_priority_findings`` is provided,
-    it is awaited with those findings so the caller can hold/notify while the
-    remaining dates are still being swept.
+    *before* the rest of the range.
+
+    If ``on_open_seat`` is provided, it is invoked the moment any individual
+    showtime's seat map confirms usable open seats (not after the date or
+    sweep finishes) so a hold can start within seconds.
 
     Returns (findings, sources_checked, details_summary).
     """
@@ -1690,7 +1726,9 @@ async def run_all_checks(
         async with sem:
             try:
                 if source == "amc":
-                    findings = await check_amc(theatre, movie_name, target_date)
+                    findings = await check_amc(
+                        theatre, movie_name, target_date, on_open_seat=on_open_seat
+                    )
                 elif source == "fandango":
                     findings = await check_fandango(theatre, movie_name, target_date)
                 else:
@@ -1721,26 +1759,11 @@ async def run_all_checks(
                 phase_findings.extend(r)
         return phase_findings
 
-    # Phase 1 — near-term dates. Kick off hold/notify in the background so
-    # phase 2 can scrape further-out dates in parallel with the (slow) hold.
     priority_findings = await _phase(priority_dates)
     all_findings.extend(priority_findings)
-    priority_cb_task = None
-    if on_priority_findings and priority_findings:
-        async def _safe_priority_cb(batch=priority_findings):
-            try:
-                await on_priority_findings(batch)
-            except Exception as exc:
-                log.warning("on_priority_findings callback failed: %s", exc)
 
-        priority_cb_task = asyncio.create_task(_safe_priority_cb())
-
-    # Phase 2 — remaining dates in the configured range.
     rest_findings = await _phase(rest_dates)
     all_findings.extend(rest_findings)
-
-    if priority_cb_task is not None:
-        await priority_cb_task
 
     for theatre in theatres:
         source = theatre.get("source", "amc")
