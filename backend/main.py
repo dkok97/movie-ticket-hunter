@@ -163,8 +163,8 @@ async def _hold_seats_for_findings(findings: list[dict]):
             return
         async with sem:
             try:
-                url = await asyncio.wait_for(
-                    purchase.hold_seat(
+                diag = await asyncio.wait_for(
+                    purchase.hold_seat_verbose(
                         showtime_id,
                         seat_names=f.get("available_seats", []),
                         num_seats=num_seats,
@@ -174,8 +174,18 @@ async def _hold_seats_for_findings(findings: list[dict]):
             except Exception as exc:
                 log.warning("Seat hold errored for showtime %s: %s", showtime_id, exc)
                 return
-            if url:
-                f["order_url"] = url
+            if diag.get("order_url"):
+                f["order_url"] = diag["order_url"]
+            else:
+                # Logged at stage-specific WARNING level inside purchase.py too, but
+                # summarise here with the full diagnostics for quick triage — this
+                # is the line to grep server logs for when holds mysteriously never
+                # show up in notifications.
+                log.warning(
+                    "No hold for showtime %s: stage=%s error=%s final_url=%s final_title=%s",
+                    showtime_id, diag.get("stage"), diag.get("error"),
+                    diag.get("final_url"), diag.get("final_title"),
+                )
 
     await asyncio.gather(*[_hold(f) for f in findings])
 
@@ -384,6 +394,39 @@ async def clear_history():
     """Delete all bot runs and ticket findings."""
     db.clear_history()
     return {"status": "ok", "message": "All runs and findings cleared."}
+
+
+@app.get("/api/debug/hold-test")
+async def debug_hold_test(showtime_id: str = "", ticket_url: str = "", num_seats: int = 1):
+    """Manually run the seat-hold flow against a real showtime and return
+    full diagnostics — for verifying auto_hold_seats actually works from
+    this deployment (AMC's checkout/order-creation step may be guarded by
+    stricter anti-fraud rules than plain page views, which can behave very
+    differently from a datacenter IP like Railway's vs. a residential one).
+
+    Pass either `showtime_id` directly, or `ticket_url` (the seat-map link
+    from a notification / /api/findings, e.g.
+    https://www.amctheatres.com/showtimes/145301196/seats) and the id will
+    be extracted for you.
+    """
+    import re as _re
+    import purchase
+
+    if not showtime_id and ticket_url:
+        m = _re.search(r"/showtimes/(\d+)", ticket_url)
+        showtime_id = m.group(1) if m else ""
+
+    if not showtime_id:
+        raise HTTPException(400, "Provide showtime_id or a ticket_url containing /showtimes/{id}")
+
+    try:
+        result = await asyncio.wait_for(
+            purchase.hold_seat_verbose(showtime_id, num_seats=num_seats),
+            timeout=90,
+        )
+    except asyncio.TimeoutError:
+        return {"order_url": None, "stage": "timeout", "error": "hold_seat_verbose exceeded 90s"}
+    return result
 
 
 @app.post("/api/test-notification")
