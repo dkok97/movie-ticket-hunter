@@ -48,7 +48,15 @@ _ACCESSIBLE_SEAT_RE = re.compile(
     r"wheel\s*chair|companion|accessible|handicap|\bada\b", re.IGNORECASE
 )
 
-_CLOSE_BANNER_SELECTORS = ('button[aria-label="Close"]', 'button:has-text("Close")')
+# Confirmed via a live debug dump that AMC's real buttons are
+# "Close this consent banner" / "Close Cookie Preferences" — neither matched
+# the exact-text/exact-aria-label selectors this used to have, meaning the
+# consent banner was silently never getting dismissed. Use a substring match
+# instead so wording changes don't silently break this again.
+_CLOSE_BANNER_SELECTORS = (
+    'button[aria-label*="Close" i]',
+    'button:has-text("Close")',
+)
 
 
 async def hold_seat(
@@ -110,6 +118,8 @@ async def hold_seat_verbose(
     seats_url = f"https://www.amctheatres.com/showtimes/{showtime_id}/seats"
     context = None
     page = None
+    console_errors: list[str] = []
+    failed_requests: list[str] = []
     try:
         async with br._page_sem:
             context = await browser_.new_context(
@@ -118,6 +128,19 @@ async def hold_seat_verbose(
                 locale="en-US",
             )
             page = await context.new_page()
+            if debug_screenshot:
+                # Only wired up for the manual debug endpoint — these listeners add
+                # overhead we don't want on the hot auto-hold path.
+                page.on("pageerror", lambda exc: console_errors.append(f"pageerror: {exc}"))
+                page.on(
+                    "console",
+                    lambda msg: console_errors.append(f"console.{msg.type}: {msg.text}")
+                    if msg.type in ("error", "warning") else None,
+                )
+                page.on(
+                    "requestfailed",
+                    lambda req: failed_requests.append(f"{req.method} {req.url} — {req.failure}"),
+                )
 
             diag["stage"] = "goto_seats_page"
             await page.goto(seats_url, wait_until="domcontentloaded", timeout=45000)
@@ -134,14 +157,14 @@ async def hold_seat_verbose(
             if selected == 0:
                 diag["error"] = "no open/selectable seat checkboxes found on the live page"
                 log.warning("Hold[%s]: %s (sold out, or page shape changed)", showtime_id, diag["error"])
-                return await _finish(diag, page, debug_screenshot)
+                return await _finish(diag, page, debug_screenshot, console_errors, failed_requests)
 
             diag["stage"] = "continue_to_tickets"
             if not await _click_continue(page):
                 diag["error"] = "'Continue' button not found/clickable after selecting seat(s)"
                 diag["button_labels"] = await _dump_button_labels(page)
                 log.warning("Hold[%s]: %s", showtime_id, diag["error"])
-                return await _finish(diag, page, debug_screenshot)
+                return await _finish(diag, page, debug_screenshot, console_errors, failed_requests)
 
             await page.wait_for_timeout(1500)
 
@@ -156,14 +179,14 @@ async def hold_seat_verbose(
                 diag["error"] = "'Add Adult Ticket' button not found/clickable on ticket-type page"
                 diag["button_labels"] = await _dump_button_labels(page)
                 log.warning("Hold[%s]: %s (labels seen: %s)", showtime_id, diag["error"], diag["button_labels"])
-                return await _finish(diag, page, debug_screenshot)
+                return await _finish(diag, page, debug_screenshot, console_errors, failed_requests)
 
             diag["stage"] = "continue_to_order"
             if not await _click_continue(page):
                 diag["error"] = "'Continue' button not found/clickable after choosing ticket type"
                 diag["button_labels"] = await _dump_button_labels(page)
                 log.warning("Hold[%s]: %s", showtime_id, diag["error"])
-                return await _finish(diag, page, debug_screenshot)
+                return await _finish(diag, page, debug_screenshot, console_errors, failed_requests)
 
             diag["stage"] = "wait_for_order"
             try:
@@ -177,7 +200,7 @@ async def hold_seat_verbose(
                 log.warning(
                     "Hold[%s]: %s — landed on %s", showtime_id, diag["error"], final_url,
                 )
-                return await _finish(diag, page, debug_screenshot)
+                return await _finish(diag, page, debug_screenshot, console_errors, failed_requests)
 
             m = _ORDER_URL_RE.match(final_url)
             order_url = m.group(0) if m else final_url
@@ -188,7 +211,7 @@ async def hold_seat_verbose(
     except Exception as exc:
         diag["error"] = f"{type(exc).__name__}: {exc}"
         log.error("Hold[%s]: failed at stage=%s: %s", showtime_id, diag["stage"], exc)
-        return await _finish(diag, page, debug_screenshot)
+        return await _finish(diag, page, debug_screenshot, console_errors, failed_requests)
     finally:
         if context is not None:
             try:
@@ -197,9 +220,20 @@ async def hold_seat_verbose(
                 pass
 
 
-async def _finish(diag: dict, page, debug_screenshot: bool = False) -> dict:
+async def _finish(
+    diag: dict,
+    page,
+    debug_screenshot: bool = False,
+    console_errors: list[str] | None = None,
+    failed_requests: list[str] | None = None,
+) -> dict:
     """Best-effort: capture where the browser ended up (and, on failure when
-    requested, a screenshot) for diagnostics."""
+    requested, a screenshot + console/network errors) for diagnostics."""
+    if debug_screenshot and diag.get("order_url") is None:
+        if console_errors:
+            diag["console_errors"] = console_errors[:30]
+        if failed_requests:
+            diag["failed_requests"] = failed_requests[:30]
     if page is not None:
         try:
             diag["final_url"] = page.url
@@ -229,10 +263,12 @@ async def _finish(diag: dict, page, debug_screenshot: bool = False) -> dict:
 
 
 async def _dismiss_cookie_banner(page):
+    """Dismiss cookie/consent banners — there can be more than one (e.g. a
+    consent banner AND a separate cookie-preferences prompt), so try every
+    selector rather than stopping at the first successful click."""
     for sel in _CLOSE_BANNER_SELECTORS:
         try:
             await page.locator(sel).first.click(timeout=2000)
-            return
         except Exception:
             continue
 
