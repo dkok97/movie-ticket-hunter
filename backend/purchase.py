@@ -129,7 +129,7 @@ async def hold_seat_verbose(
             await _dismiss_cookie_banner(page)
 
             diag["stage"] = "select_seats"
-            selected = await _select_seats(page, seat_names, num_seats)
+            selected = await _select_seats(page, seat_names, num_seats, diag)
             diag["seats_selected"] = selected
             if selected == 0:
                 diag["error"] = "no open/selectable seat checkboxes found on the live page"
@@ -258,7 +258,7 @@ async def _robust_click(page, selector: str, timeout: int = 8000) -> bool:
         return False
 
 
-async def _select_seats(page, seat_names: list[str], num_seats: int) -> int:
+async def _select_seats(page, seat_names: list[str], num_seats: int, diag: dict | None = None) -> int:
     """Click up to `num_seats` open seat checkboxes on the live page,
     preferring seats named in `seat_names` (in order) when still open.
 
@@ -269,18 +269,29 @@ async def _select_seats(page, seat_names: list[str], num_seats: int) -> int:
     count = await checkboxes.count()
 
     open_seats = []  # (index, seat_code)
+    n_disabled = n_accessible = 0
     for i in range(count):
         cb = checkboxes.nth(i)
         try:
             if await cb.is_disabled():
+                n_disabled += 1
                 continue
             label = (await cb.get_attribute("aria-label")) or ""
         except Exception:
             continue
         if _ACCESSIBLE_SEAT_RE.search(label):
+            n_accessible += 1
             continue
         code = label.strip().split(" ")[-1] if label else ""
         open_seats.append((i, code))
+    log.info(
+        "Seat map for hold: %d checkbox(es) total, %d disabled, %d accessible, %d open-standard",
+        count, n_disabled, n_accessible, len(open_seats),
+    )
+    if diag is not None:
+        diag["seat_checkbox_count"] = count
+        diag["seat_disabled_count"] = n_disabled
+        diag["seat_accessible_count"] = n_accessible
 
     priority = {code: idx for idx, code in enumerate(seat_names)}
     open_seats.sort(key=lambda pair: priority.get(pair[1], len(priority)))
