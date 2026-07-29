@@ -260,12 +260,10 @@ async def hold_seat_verbose(
             await page.wait_for_timeout(1500)
 
             diag["stage"] = "add_ticket_type"
-            added = 0
-            for _ in range(selected):
-                if await _robust_click(page, 'button[aria-label="Add Adult Ticket"]'):
-                    added += 1
-                else:
-                    break
+            # Ticket-type page can lag behind navigation (slow proxy / hydration).
+            # Waiting for the control + trying a few aria-label variants only
+            # helps — on a fast page wait_for returns immediately.
+            added = await _add_adult_tickets(page, selected)
             if added == 0:
                 diag["error"] = "'Add Adult Ticket' button not found/clickable on ticket-type page"
                 diag["button_labels"] = await _dump_button_labels(page)
@@ -379,6 +377,57 @@ async def _click_continue(page) -> bool:
     layout being correct.
     """
     return await _robust_click(page, "text=Continue")
+
+
+# AMC's ticket-type stepper has used a few aria-label wordings over time /
+# across formats. Prefer the exact known-good label first; fall back to
+# looser matches so a slow hydrate or minor copy change doesn't kill a hold.
+_ADD_ADULT_TICKET_SELECTORS = (
+    'button[aria-label="Add Adult Ticket"]',
+    'button[aria-label="Add Adult ticket"]',
+    'button[aria-label*="Add Adult Ticket" i]',
+    'button[aria-label*="Add Adult" i]',
+    'button[aria-label*="Adult Ticket" i]',
+)
+
+
+async def _add_adult_tickets(page, count: int) -> int:
+    """Increment the Adult ticket quantity `count` times on the ticket-type
+    page. Returns how many successful clicks we got (0 = control never found).
+
+    Waits for *any* matching control to appear (up to ~12s) before the first
+    click — the seats→tickets navigation can land on a still-hydrating page
+    under a residential proxy, which is what caused the Railway failure where
+    we reached `/tickets?seats=…` (title "Select Tickets") but the exact
+    `Add Adult Ticket` button wasn't clickable yet. Does not slow the happy
+    path: `wait_for_selector` returns as soon as the control exists.
+    """
+    if count <= 0:
+        return 0
+
+    await _dismiss_cookie_banner(page)
+
+    # Single OR-wait across all known adult-ticket controls (not one 12s
+    # timeout per selector — that would waste up to a minute on a miss).
+    combined = ", ".join(_ADD_ADULT_TICKET_SELECTORS)
+    try:
+        await page.wait_for_selector(combined, timeout=12000)
+    except Exception:
+        # One more beat for a late paint, then give robust_click a last try.
+        await page.wait_for_timeout(1500)
+
+    added = 0
+    for _ in range(count):
+        clicked = False
+        for sel in _ADD_ADULT_TICKET_SELECTORS:
+            if await _robust_click(page, sel, timeout=5000):
+                clicked = True
+                added += 1
+                await page.wait_for_timeout(200)
+                break
+        if not clicked:
+            break
+    return added
 
 
 async def _robust_click(page, selector: str, timeout: int = 8000) -> bool:
