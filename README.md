@@ -154,6 +154,14 @@ DATA_DIR=/data
 HOLD_PROXY_SERVER=http://geo.iproyal.com:12321
 HOLD_PROXY_USERNAME=your_proxy_username
 HOLD_PROXY_PASSWORD=your_proxy_password
+
+# Optional: IPRoyal-style sticky-session targeting appended to the password
+# (defaults shown — tune to the theatre's actual city/state). Set
+# HOLD_PROXY_STICKY=0 to disable if your provider isn't IPRoyal.
+HOLD_PROXY_COUNTRY=us
+HOLD_PROXY_STATE=newyork
+HOLD_PROXY_CITY=newyork
+HOLD_PROXY_STICKY_LIFETIME=15m
 ```
 
 ### `auto_hold_seats` requires a residential proxy on cloud hosts
@@ -173,6 +181,25 @@ Any residential-proxy provider that gives you an `http://host:port` +
 credentials works (e.g. IPRoyal, Bright Data, Smartproxy). Only the hold
 flow uses this proxy — the much higher-volume plain scraping/seat-checking
 path never needs one, since it doesn't require JS to load.
+
+**A plain rotating residential proxy isn't enough on its own.** Confirmed
+via production debugging: IPRoyal's default rotating pool got hard-blocked
+by Cloudflare's WAF outright (a `1020` firewall deny — worse than the
+datacenter-IP case, which at least loaded the page). Two things fixed it:
+
+1. **A sticky session per hold**, so the whole flow (document, every JS/CSS
+   asset, every click) comes from *one* IP instead of potentially a
+   different IP per request — which by itself looks exactly like a botnet.
+2. **Geo-targeting near the theatre**, so the exit node looks like a genuine
+   local resident instead of a random global IP from a heavily-abused pool.
+
+`backend/purchase.py` builds this automatically for IPRoyal by appending
+`_country-..._state-..._city-..._session-<random>_lifetime-...` to
+`HOLD_PROXY_PASSWORD` (tunable via `HOLD_PROXY_COUNTRY`/`HOLD_PROXY_STATE`/
+`HOLD_PROXY_CITY`/`HOLD_PROXY_STICKY_LIFETIME`, or disable with
+`HOLD_PROXY_STICKY=0` for providers that use different syntax). See
+[IPRoyal's docs](https://docs.iproyal.com/proxies/residential/proxy/rotation)
+for the exact format if you're on a different provider.
 
 ---
 

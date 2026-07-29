@@ -32,12 +32,18 @@ run) is routed through a residential/mobile proxy when one is configured, via
 the HOLD_PROXY_SERVER / HOLD_PROXY_USERNAME / HOLD_PROXY_PASSWORD env vars
 (see README). Without a proxy configured, this still runs — from a
 datacenter host it just won't be able to complete a hold, same as before.
+
+Also confirmed (2026-07-29): a plain rotating residential proxy isn't enough
+either — see `_proxy_config()` for why a *sticky, geo-targeted* session is
+required instead.
 """
 
 import base64
 import logging
 import os
+import random
 import re
+import string
 
 import browser as br
 
@@ -67,12 +73,38 @@ _CLOSE_BANNER_SELECTORS = (
 )
 
 
+def _iproyal_session_id() -> str:
+    """8-char lowercase-alphanumeric session id, per IPRoyal's sticky-session
+    spec (docs.iproyal.com/proxies/residential/proxy/rotation)."""
+    alphabet = string.ascii_lowercase + string.digits
+    return "".join(random.choices(alphabet, k=8))
+
+
 def _proxy_config() -> dict | None:
     """Playwright `proxy` dict for the hold flow's browser context, from
     HOLD_PROXY_SERVER (e.g. `http://geo.iproyal.com:12321`) plus optional
     HOLD_PROXY_USERNAME / HOLD_PROXY_PASSWORD. None if unset (falls back to
     the deployment's own IP, which works fine locally but not from a
-    datacenter host like Railway — see module docstring)."""
+    datacenter host like Railway — see module docstring).
+
+    Confirmed via production debugging (2026-07-29): a *rotating* residential
+    proxy (default IPRoyal behaviour — a new, possibly-shared IP per
+    connection) got hard-blocked by Cloudflare's WAF outright ("Sorry, you
+    have been blocked", a 1020 firewall deny — worse than the plain
+    datacenter-IP case, which at least loaded the document). Two things fix
+    this for IPRoyal specifically, applied by appending targeting keys to the
+    password (docs.iproyal.com/proxies/residential/proxy/{rotation,location}):
+      - A *sticky* session (`_session-<8char>_lifetime-<dur>`) so the whole
+        hold flow — document, JS/CSS assets, every click — comes from one IP,
+        instead of the document and each asset request potentially landing on
+        different IPs, which by itself looks exactly like a botnet to a WAF.
+      - Geo targeting (`_country-us_state-..._city-...`) pinned near the
+        theatre being held for, so the traffic looks like a genuine local
+        resident rather than a random global exit node from an abused pool.
+    Configurable via HOLD_PROXY_COUNTRY / HOLD_PROXY_STATE / HOLD_PROXY_CITY /
+    HOLD_PROXY_STICKY_LIFETIME; only applied when HOLD_PROXY_USERNAME looks
+    like an IPRoyal username (set HOLD_PROXY_STICKY=0 to disable entirely for
+    other providers whose password syntax this would break)."""
     server = os.environ.get("HOLD_PROXY_SERVER", "").strip()
     if not server:
         return None
@@ -81,6 +113,22 @@ def _proxy_config() -> dict | None:
     password = os.environ.get("HOLD_PROXY_PASSWORD", "").strip()
     if username:
         cfg["username"] = username
+    if password and os.environ.get("HOLD_PROXY_STICKY", "1").strip() not in ("0", "false", "False"):
+        country = os.environ.get("HOLD_PROXY_COUNTRY", "us").strip()
+        state = os.environ.get("HOLD_PROXY_STATE", "newyork").strip()
+        city = os.environ.get("HOLD_PROXY_CITY", "newyork").strip()
+        lifetime = os.environ.get("HOLD_PROXY_STICKY_LIFETIME", "15m").strip()
+        parts = [password]
+        if country:
+            parts.append(f"country-{country}")
+        if state:
+            parts.append(f"state-{state}")
+        if city:
+            parts.append(f"city-{city}")
+        parts.append(f"session-{_iproyal_session_id()}")
+        if lifetime:
+            parts.append(f"lifetime-{lifetime}")
+        password = "_".join(parts)
     if password:
         cfg["password"] = password
     return cfg
