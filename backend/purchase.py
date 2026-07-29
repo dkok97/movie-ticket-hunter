@@ -208,7 +208,7 @@ async def _finish(diag: dict, page, debug_screenshot: bool = False) -> dict:
             pass
         if debug_screenshot and diag.get("order_url") is None:
             try:
-                png = await page.screenshot(full_page=False)
+                png = await page.screenshot(full_page=True)
                 diag["screenshot_b64"] = base64.b64encode(png).decode("ascii")
             except Exception:
                 pass
