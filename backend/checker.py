@@ -75,29 +75,21 @@ async def check_amc(theatre: dict, movie_name: str, target_date: str) -> list[di
     """Check AMC for ticket availability.
 
     Order (each falls through to the next only if it finds nothing):
-      0. AMC Developer API — authoritative when the key works (empty = truly
-         no seats, so we return it and stop).
       1. Plain-HTTP movie page — proven to return real showtime data for this
          movie/theatre, and it's fast (no browser overhead).
       2. Headless browser — fallback for when plain HTTP is blocked by Queue-it
          or the page is only rendered client-side.
       3. Other web strategies.
 
+    The AMC Developer API path was removed — we never got an approved key,
+    and the 403s just added noise every cycle. Web scraping is the real path.
+
     Critically, an empty result from the browser is NOT terminal — we keep
     trying the remaining strategies so one flaky path can't zero out a cycle.
     """
     conf = cfg.get_config()
-    api_key = conf.get("amc_api_key", "")
-    vendor_id = conf.get("amc_vendor_id", "")
     movie_slug = conf.get("amc_movie_slug", "")
     use_browser = str(conf.get("use_browser", True)).lower() not in ("false", "0", "no")
-
-    # Strategy 0 (preferred): AMC Developer API.
-    if api_key:
-        api_findings = await _amc_developer_api(theatre, movie_name, target_date, api_key, vendor_id)
-        if api_findings is not None:
-            return api_findings  # authoritative, even when empty
-        log.warning("AMC API unavailable for %s — falling back to web scraping", target_date)
 
     async def _verify_or_drop(findings: list[dict]) -> list[dict]:
         """Seat-verify (plain HTTP, then browser fallback) or fail closed."""
