@@ -208,10 +208,20 @@ async def _finish(diag: dict, page, debug_screenshot: bool = False) -> dict:
             pass
         if debug_screenshot and diag.get("order_url") is None:
             try:
-                png = await page.screenshot(full_page=True)
-                diag["screenshot_b64"] = base64.b64encode(png).decode("ascii")
+                await page.locator('input[type="checkbox"][aria-label]').first.scroll_into_view_if_needed(timeout=5000)
             except Exception:
                 pass
+            png = None
+            try:
+                png = await page.screenshot(full_page=True, timeout=15000)
+            except Exception as exc:
+                log.warning("Full-page debug screenshot failed (%s), retrying viewport-only", exc)
+                try:
+                    png = await page.screenshot(full_page=False)
+                except Exception:
+                    pass
+            if png:
+                diag["screenshot_b64"] = base64.b64encode(png).decode("ascii")
     return diag
 
 
