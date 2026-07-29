@@ -90,7 +90,7 @@ async def hold_seat_verbose(
     diag = {
         "order_url": None, "stage": "start", "error": None,
         "final_url": None, "final_title": None, "seats_selected": 0,
-        "screenshot_b64": None,
+        "screenshot_b64": None, "button_labels": None,
     }
 
     if not showtime_id:
@@ -139,6 +139,7 @@ async def hold_seat_verbose(
             diag["stage"] = "continue_to_tickets"
             if not await _click_continue(page):
                 diag["error"] = "'Continue' button not found/clickable after selecting seat(s)"
+                diag["button_labels"] = await _dump_button_labels(page)
                 log.warning("Hold[%s]: %s", showtime_id, diag["error"])
                 return await _finish(diag, page, debug_screenshot)
 
@@ -153,12 +154,14 @@ async def hold_seat_verbose(
                     break
             if added == 0:
                 diag["error"] = "'Add Adult Ticket' button not found/clickable on ticket-type page"
-                log.warning("Hold[%s]: %s", showtime_id, diag["error"])
+                diag["button_labels"] = await _dump_button_labels(page)
+                log.warning("Hold[%s]: %s (labels seen: %s)", showtime_id, diag["error"], diag["button_labels"])
                 return await _finish(diag, page, debug_screenshot)
 
             diag["stage"] = "continue_to_order"
             if not await _click_continue(page):
                 diag["error"] = "'Continue' button not found/clickable after choosing ticket type"
+                diag["button_labels"] = await _dump_button_labels(page)
                 log.warning("Hold[%s]: %s", showtime_id, diag["error"])
                 return await _finish(diag, page, debug_screenshot)
 
@@ -252,6 +255,15 @@ async def _click_continue(page) -> bool:
 
 
 async def _robust_click(page, selector: str, timeout: int = 8000) -> bool:
+    """Try a real click first; fall back to a JS-dispatched click on the same
+    element if that times out.
+
+    Deliberately skips `scroll_into_view_if_needed()` in the fallback: a
+    JS-level `.click()` doesn't need the element to be visible/in-viewport at
+    all, and on pages with broken layout (seen in production: a ticket-type
+    screen rendering ~150,000px tall) scrolling into view can itself be slow
+    or pointless.
+    """
     try:
         await page.click(selector, timeout=timeout)
         return True
@@ -261,11 +273,23 @@ async def _robust_click(page, selector: str, timeout: int = 8000) -> bool:
         loc = page.locator(selector).first
         if await loc.count() == 0:
             return False
-        await loc.scroll_into_view_if_needed()
         await loc.evaluate("el => el.click()")
         return True
     except Exception:
         return False
+
+
+async def _dump_button_labels(page, limit: int = 40) -> list[str]:
+    """Best-effort diagnostic: aria-labels of buttons currently in the DOM,
+    for figuring out what a failed click *should* have targeted."""
+    try:
+        labels = await page.eval_on_selector_all(
+            "button[aria-label]",
+            "(els) => els.map(e => e.getAttribute('aria-label'))",
+        )
+        return labels[:limit]
+    except Exception:
+        return []
 
 
 async def _select_seats(page, seat_names: list[str], num_seats: int, diag: dict | None = None) -> int:
